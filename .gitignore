@@ -1,0 +1,33 @@
+# Node / Next.js
+app/node_modules/
+app/.next/
+app/out/
+app/build/
+app/coverage/
+app/*.tsbuildinfo
+app/next-env.d.ts
+
+# UX Builder runtime data (per-session JSON + generated wireframes)
+app/data/
+
+# Env files (the example IS committed; the local one is not)
+app/.env
+app/.env.local
+app/.env*.local
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local Claude Code state (per-machine session and settings)
+.claude/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
