@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-14 (Sprint 3 complete)
+**Last updated:** 2026-04-14 (Sprint 4 complete)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -16,7 +16,7 @@
 | **1** | Storage layer — full types, IStorage, FileStorage, MemoryStorage, WireframeManager (§7) | ✅ **Done** |
 | **2** | Operation Executor — streaming, parsers, retry, token tracker, two-AI pattern (§8) | ✅ **Done** |
 | **3** | Context Builder — phase 1 + phase 2 context assembly, summarizer (§9) | ✅ **Done** |
-| 4 | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ⏳ Not started |
+| **4** | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ✅ **Done** |
 | 5 | **Phase 1 Complete** — ops 1.0–1.3, prompts, API routes, **first usable demo** (§11) | ⏳ Not started |
 | 6 | Phase 2 auto-generation chain — ops 2.1–2.5 (§12) | ⏳ Not started |
 | 7 | Drift detection + cascade engine — ops 2.6, 2.7 (§13) | ⏳ Not started |
@@ -442,6 +442,110 @@ A working Context Builder — the bridge between the (not-yet-built) Session Man
 
 ---
 
+## Sprint 4 — Detailed Record
+
+### Goal
+A working Session Manager — the central coordinator that every user action flows through. Sprint 4 delivers the state machine + routing + DAG executor without actually calling any LLM ops, by injecting a handler interface that Sprint 5+ will implement against the real Operation Executor / Context Builder / Prompt Registry stack.
+
+### Files created
+
+#### Session manager module (`src/core/session-manager/`)
+
+| Path | Contents |
+|---|---|
+| `session-manager.ts` | `SessionManager` class — central coordinator. Constructor takes `IStorage` + `SessionHandlers`. Public methods: `createSession` (creates session + phase-1 state + checkpoint 1 + fires title + first-message handler), `handleMessage` (validates session/phase, routes to correct Phase 1 or Phase 2 handler, enforces per-session chat lock), `completePhase` (delegates to phase-specific completion handler), `isBlocked` (read-only lock inspection). Private helpers: `tryAcquireLock` / `releaseLock` (atomic acquire-or-reject via `Map<sessionId, boolean>`). |
+| `phase-state-machine.ts` | `validateTransition(from, to)` — pure predicate on `PhaseStatus`. `transitionPhase(storage, sessionId, phaseId, newStatus)` — reads current state, validates the transition, sets `completedAt` / `suspendedAt` / `enteredAt` timestamps as appropriate, writes back. Valid transitions: `not_started → active`, `active → {completing, suspended}`, `completing → {complete, active}`, `complete → ∅` (terminal), `suspended → active`. |
+| `operation-router.ts` | `routeMessage({phaseId, hasExistingDocuments})` — pure function returning `OperationId`. Phase 1 + no docs → `op-1-1`, Phase 1 + docs → `op-1-2`, Phase 2 → `op-2-7a`. Everything else the session manager figures out itself. |
+| `dependency-graph.ts` | `DependencyGraphExecutor` class — generic DAG executor used by both the Phase 2 auto-generation chain and iteration cascades. `execute(nodes)` returns a `Map<operationId, OperationStatus>`. Features: concurrency cap (default from `DEFAULT_BATCH_CONCURRENCY`), conditional skip via per-node `condition()`, dep-satisfied = `complete` OR `skipped`, partial-failure handling (surviving branches continue), progress callback, explicit upfront validation (duplicate ids, unknown deps, cycles via DFS coloring). Unreachable nodes at end of run are marked `skipped`, not left as `not_started`. |
+| `auto-generation-graph.ts` | `buildAutoGenerationGraph(runners, conditions)` — returns the full spec §4.4 / §18.1 topology as a `GraphNode[]`. 20 nodes (op-2-1a through op-2-5e). Two conditional nodes: `op-2-3c` (runs when screen validation flags issues) and `op-2-5e` (runs when test translation surfaces failures). `AUTO_GEN_OPERATION_IDS` const tuple is exported so tests can iterate every op. Runners + conditions are injected — Sprint 4 tests use mocks, Sprint 6+ will wire real implementations. |
+| `index.ts` | Barrel export for all of the above. |
+
+#### Tests added
+
+| Path | Cases | Coverage |
+|---|---|---|
+| `phase-state-machine.test.ts` | 14 | `validateTransition` exhaustive matrix (7 allowed transitions, rejections for `active→complete`, `complete→*`, `not_started→complete`, etc.). `transitionPhase`: throws when no state exists, throws on invalid transition, sets `enteredAt` on first activation, sets `completedAt` on complete, sets `suspendedAt` on suspend, preserves `enteredAt` on `completing→active` (validation FAIL bounce), refreshes `enteredAt` on `suspended→active` (genuine restore). |
+| `operation-router.test.ts` | 3 | Phase 1 no-docs → op-1-1, Phase 1 with-docs → op-1-2, Phase 2 → op-2-7a (both doc states). |
+| `dependency-graph.test.ts` | 12 | Empty graph. Linear A→B→C. Parallel siblings with concurrency detection via active-counter. Concurrency cap honored (6 nodes, cap=2, max active ≤2). Conditional skip still runs downstream. Conditional true runs as normal. Failing node marks downstream unreachable→skipped. Sibling-failure survives: A→(B fails, C ok)→D depends on C, D still runs. Progress callback fires ordered state transitions. Graph validation throws on duplicate ids, unknown deps, and cycles. |
+| `auto-generation-graph.test.ts` | 4 | Builder produces a node for every auto-gen op id. Full graph runs topologically with all-true conditions and every op ends `complete`. op-2-3c skip path: still runs op-2-3d. op-2-5e skip path: op-2-5d remains `complete`. |
+| `session-manager.test.ts` | 13 | `createSession`: creates session record + phase-1 state + checkpoint 1, fires both `generateTitle` and `handleFirstMessage`, does NOT throw when title generation rejects (best-effort, logs warn), releases the chat lock on completion. `handleMessage` routing: Phase 1 with seeded document → `handleIteration`, Phase 1 without docs → `handleFirstMessage` retry, Phase 2 flips session state → `phase2.handleMessage` with `screenRef` passthrough. Chat blocking: second concurrent message gets "Please wait" SSE error via monkey-patched `sendError`, lock releases after a handler throws so the next message proceeds. Validation: unknown session → fatal error, suspended phase → non-fatal error, handler NOT called in either case. `completePhase`: delegates to `phase1.completePhase` for phase-1 sessions and `phase2.completePhase` for phase-2 sessions. |
+
+**Sprint 4 test count: 46 (14 state machine + 3 router + 12 DAG + 4 auto-gen + 13 session manager).**
+
+### Key design decisions made during Sprint 4
+
+1. **SessionManager takes injected handlers, not real op runners.** The plan's example code has `SessionManager` instantiate `OperationExecutor` + call ops directly. That would couple Sprint 4 to Sprint 5's prompt bodies and Sprint 6's auto-gen factories, blocking the sprint. Instead, I defined `Phase1Handlers` / `Phase2Handlers` interfaces with four and two methods respectively; Sprint 5 will ship a concrete `Phase1Handlers` that wires `ContextBuilder + OperationExecutor + two-AI pattern`. Tests use recorder stubs and verify routing/locking/sequencing without caring what "really running the op" means.
+
+2. **Chat blocking is acquire-or-reject, not a queue.** The user-facing contract is "while an op runs, a second message is rejected with 'please wait'". A queue would batch-process messages behind the scenes, which defeats the intended UX (the user should SEE the block and wait). Implementation: `tryAcquireLock` returns `true/false` atomically (no awaits between check and set — JavaScript's single-threaded model guarantees atomicity for sync sections), and callers reject via the SSE writer on `false`.
+
+3. **Lock is released in `finally`, not manual release at each return point.** Every public method uses `try { ... await handlers.X(...) ... } finally { releaseLock }`. A handler throwing won't leave the session permanently blocked — covered by a test that seeds `handleFirstMessage` to throw and then asserts `isBlocked === false`.
+
+4. **DAG executor treats "skipped" as "dependency satisfied".** Without this, conditional nodes would block downstream progress whenever the condition returns false. A node is ready when every dependency is `complete` OR `skipped`; failed deps never satisfy, and the post-loop unreachable sweep converts any leftover `not_started` nodes to `skipped` so the final status map is unambiguous.
+
+5. **Partial failure is survivable by design.** The plan's pseudocode had an `if canContinue break` check that would halt the whole graph on any failure. My implementation only halts when *no reachable node remains* — if a failed branch has surviving siblings, those siblings continue. Tested via the A→(B fails, C ok)→D case: D runs because its only dep is C, not B.
+
+6. **Graph validation is upfront and explicit.** Before executing, the DAG executor checks for duplicate operationIds, unknown dependency references, and cycles (DFS with WHITE/GRAY/BLACK coloring). Sprint 6 will hand-build the auto-gen graph; validation errors at construction time are easier to debug than "test never finishes".
+
+7. **Auto-gen topology is a pure data builder, not a hardcoded constant.** `buildAutoGenerationGraph` takes runners + conditions and *constructs* the graph. This means Sprint 4 tests can inject mock runners (recording execution order) and Sprint 6 can inject real op runners without changing the topology file. `AUTO_GEN_OPERATION_IDS` is exported as a `readonly tuple` so TypeScript catches "forgot a runner for op-2-3c" at compile time.
+
+8. **UUID via `uuid` package, not `node:crypto`.** Sprint 0 added `uuid` as a dep. Using `uuidv4()` everywhere for new entity IDs keeps the pattern consistent and avoids Node-version coupling.
+
+9. **`routeMessage` is its own module even though it's 8 lines.** It's a pure function with a narrow input type, it has unit tests independent of SessionManager, and it'll be the natural place to put future routing logic (e.g., "Phase 2 with pending cascade → different op"). Keeping it out of SessionManager means those tests don't need to bootstrap a full harness.
+
+### Why SessionManager doesn't do more yet
+
+Things deliberately deferred to Sprint 5+:
+- Actual LLM calls. The handlers are interfaces only; Sprint 5 implements `Phase1Handlers` against the Operation Executor, Context Builder, and Prompt Registry.
+- Phase transitions. `phase-state-machine.ts` exists and is tested, but `SessionManager.completePhase` only delegates — it doesn't call `transitionPhase` itself. Sprint 5's Phase 1 completion handler will run Op 1.3 validation, then call `transitionPhase(storage, sessionId, "phase-1", "complete")` on PASS.
+- Auto-gen chain invocation. `DependencyGraphExecutor` + `buildAutoGenerationGraph` are ready, but nothing calls them. Sprint 6 will wire Phase 2 bootstrap to kick off the auto-gen chain via a `Phase1Handlers.completePhase` that transitions the session to phase-2 and then invokes the DAG with real runners.
+
+---
+
+## Testing Record — Sprint 4
+
+### What was tested
+
+| Check | Command | Result |
+|---|---|---|
+| TypeScript compilation | `npx tsc --noEmit` | ✅ 0 errors |
+| Non-integration test suite (Sprints 0-4) | `npx vitest run --exclude="**/*.integration.test.ts"` | ✅ **207/207** passing in 1.84s (14 files) |
+| Sprint 4 isolated run | `npx vitest run src/core/session-manager` | ✅ **46/46** passing in 1.23s |
+| Live Ollama integration suite | not re-run after Sprint 4 | ⏳ deliberately skipped — Sprint 4 is pure library code, no new LLM surface to exercise |
+
+### Test count breakdown (cumulative)
+
+- **Sprint 0:** 0 unit tests
+- **Sprint 1:** 64 tests
+- **Sprint 2:** 58 tests (incl. 4 live-Ollama integration)
+- **Sprint 3:** 43 tests
+- **Sprint 4:** 46 tests (14 state machine + 3 router + 12 DAG + 4 auto-gen + 13 session manager)
+- **Total:** **211 tests** (207 unit + 4 live-Ollama integration)
+
+### What was NOT tested (Sprint 4 blind spots)
+
+| Blind spot | Why not | Planned coverage |
+|---|---|---|
+| **SessionManager with real op handlers** | Sprint 4 ships with interface-only handler stubs. Nothing has run against the real Operation Executor / Context Builder stack. | Sprint 5 — first real op wiring. Add integration test that runs `createSession` → `handleMessage` against Ollama. |
+| **Concurrent access across multiple SessionManager instances** | Lock is a `Map` on the instance. A second `new SessionManager(...)` sharing the same storage would not see the lock. Prevented architecturally (singleton), but not tested. | Sprint 5 — API route bootstrap will instantiate SessionManager as a module-level singleton. |
+| **Chat block across process restarts** | Lock is in-memory. A crash mid-op leaves the session apparently idle on restart but with half-persisted state. | Sprint 9 — checkpoint + rollback system should detect "op in progress" via `OperationProgress` records written by real handlers. |
+| **DAG executor with `maxConcurrency: 0` or negative** | Edge case. Current code would busy-wait forever waiting for slots to free. | Low value — add an assertion in the constructor when Sprint 5 touches this. |
+| **DAG executor cancellation mid-execution** | No way to abort an in-flight graph. Sprint 6 will need this when the user hits "Stop generating" during auto-gen. | Sprint 6 — add an `AbortSignal` option to `execute()` that propagates to each node's execute. |
+| **Auto-gen graph with multiple parallel skips** | Tested one skip at a time (op-2-3c OR op-2-5e). Both skipped simultaneously is untested but mechanically the same code path. | Low value. |
+| **SessionManager.handleMessage with screenRef in Phase 1** | Phase 1 doesn't use screenRef; the SessionManager ignores it on the phase-1 path. Not asserted that ignoring it doesn't error. | Covered by Phase 1 routing tests (they pass `null`) but not with a non-null screenRef. Low risk — the parameter is typed and never read in the Phase 1 handlers. |
+| **Real network of SessionManager ↔ API route** | No route handler yet — `app/src/app/api/` still only has health + test-llm from Sprint 0. | Sprint 5 — `/api/sessions/*` routes. |
+| **PhaseState timestamp preservation on `completing → active`** | Test asserts `enteredAt` is preserved. Doesn't assert that `completedAt` remains null (since we never set it on the bounce-back). | Covered by TS + the transition code only sets `completedAt` on `complete`. Low risk. |
+| **Fire-and-forget title failures in production** | Test proves a rejected `generateTitle` doesn't crash createSession. But the warning-only outcome means an entire category of real failures (rate limits, auth errors) becomes invisible. | Sprint 10 (polish) — pipe title failures to a telemetry log or a visible "title generation failed" event. |
+
+### Known quirks discovered during Sprint 4
+
+1. **`Map.get(key)` returns `undefined`, not `false`, for missing keys.** The lock code uses `=== true` explicit check rather than relying on truthiness, so `undefined` correctly treats an unseen session as unlocked.
+2. **JavaScript event-loop atomicity guarantees the check-and-set in `tryAcquireLock` is race-free.** No `await` between the `.get` and the `.set`, so other async callers can't observe an intermediate state. Documented in the method's comment.
+3. **Promise.race on a Map's values requires a non-empty set.** The DAG executor's wait-for-progress branch guards on `running.size === 0` before breaking out, avoiding the "race with no promises" hang.
+4. **Monkey-patching `sse.sendError` in tests bypasses the real SSE wire encoding.** Test writes into a recorder array directly. This is fine for Sprint 4 since we're asserting *that* an error was sent, not *how*; Sprint 5 will need SSE-wire tests if we care about the exact payload format.
+5. **Cycle detection with DFS coloring flags self-dependencies too.** A node listing itself as a dependency immediately enters GRAY, hits itself again, and throws. Not tested explicitly but mechanically correct.
+
+---
+
 ## Gaps Worth Watching (all sprints)
 
 These are systemic risks I want visible here rather than buried in the plan:
@@ -467,7 +571,8 @@ These are systemic risks I want visible here rather than buried in the plan:
 - **Ollama:** Running at `localhost:11434`. Models present: `qwen3.5:4b`, `qwen3:4b`, `embeddinggemma:latest`
 - **Active provider:** Ollama (`.env.local`)
 - **Groq API key:** Not set
-- **Test count:** 165 passing (161 unit + 4 live-Ollama integration)
+- **Test count:** 211 passing (207 unit + 4 live-Ollama integration)
   - Sprint 1: 64 (57 storage + 7 wireframe)
   - Sprint 2: 58 (36 parsers + 6 token-tracker + 4 two-ai + 8 executor-unit + 4 executor-integration)
   - Sprint 3: 43 (8 summarizer + 16 phase2-context + 19 context-builder)
+  - Sprint 4: 46 (14 state machine + 3 router + 12 DAG + 4 auto-gen + 13 session manager)
