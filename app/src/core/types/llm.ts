@@ -1,5 +1,11 @@
 import type { OperationId } from "./operations";
 
+// Logical model classes. Operations declare a role; the provider registry
+// maps each role to a concrete pi-ai Model based on env config.
+//   "fast"      — cheap, batch-friendly, structured output (e.g. titles, parsers)
+//   "reasoning" — slower, user-facing, conversational (e.g. goal expansion)
+export type RoleName = "fast" | "reasoning";
+
 export interface LLMMessage {
   role: "user" | "assistant" | "system";
   content: string;
@@ -43,8 +49,12 @@ export interface OperationDefinition<T = unknown> {
   maxRetries: number;
   retryPrompt: string | null;
   timeoutMs: number;
-  // Optional pi-ai routing overrides. When unset, the executor asks the
-  // provider registry for a default by role.
+  // Default model routing — the executor asks the provider registry for a
+  // model by role. Defaults to "reasoning" if unset.
+  role?: RoleName;
+  // Hard overrides — bypass role routing entirely. Use sparingly; setting
+  // these locks an op to a specific provider/model and is mostly for testing
+  // and one-off experiments.
   provider?: string;
   model?: string;
   onStreamChunk?: (chunk: string) => void;

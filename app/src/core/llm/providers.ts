@@ -1,5 +1,6 @@
 import type { Model } from "@mariozechner/pi-ai";
 import { getModel } from "@mariozechner/pi-ai";
+import type { RoleName } from "@core/types";
 
 /**
  * Provider registry for UX Builder.
@@ -24,7 +25,10 @@ import { getModel } from "@mariozechner/pi-ai";
  */
 
 export type ProviderName = "groq" | "ollama";
-export type RoleName = "fast" | "reasoning";
+
+// Re-export RoleName so call-sites can import it from either @core/types or
+// @core/llm/providers without thinking about which is canonical.
+export type { RoleName };
 
 export interface ResolvedModel {
   role: RoleName;
@@ -48,17 +52,29 @@ function currentProvider(): ProviderName {
 }
 
 function buildOllamaModel(modelId: string): Model<"openai-completions"> {
+  // Qwen3 family enables "thinking" mode by default, which produces hundreds
+  // of tokens of internal chain-of-thought before answering. That's wasteful
+  // for the structured-output ops we run here (titles, classifications, doc
+  // generation) — we want short focused responses.
+  //
+  // Setting `reasoning: true` plus `compat.thinkingFormat: "qwen-chat-template"`
+  // makes pi-ai send `chat_template_kwargs: { enable_thinking: false }` to
+  // Ollama (because we never pass `reasoningEffort` in the stream options).
+  // Ollama forwards it to the qwen3 chat template, which disables thinking.
   return {
     id: modelId,
     name: `${modelId} (Ollama)`,
     api: "openai-completions",
     provider: "ollama",
     baseUrl: process.env.OLLAMA_BASE_URL ?? DEFAULT_OLLAMA_BASE_URL,
-    reasoning: false,
+    reasoning: true,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 32000,
     maxTokens: 8192,
+    compat: {
+      thinkingFormat: "qwen-chat-template",
+    },
   };
 }
 
@@ -76,6 +92,15 @@ export function resolveModel(role: RoleName): ResolvedModel {
   const modelId = role === "fast" ? fastId : reasoningId;
   const model = getModel("groq", modelId as any);
   return { role, provider, model };
+}
+
+// pi-ai's openai-completions transport requires a non-empty apiKey even for
+// providers that don't authenticate (Ollama). Centralized here so the
+// Operation Executor doesn't need provider-specific knowledge.
+export function getApiKey(provider: ProviderName): string | undefined {
+  if (provider === "ollama") return "ollama";
+  if (provider === "groq") return process.env.GROQ_API_KEY;
+  return undefined;
 }
 
 export function describeActiveConfig(): {

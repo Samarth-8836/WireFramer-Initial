@@ -14,7 +14,7 @@
 |---|---|---|
 | **0** | Project setup — scaffold, deps, type stubs, LLM pipeline proof-of-life (§6) | ✅ **Done** |
 | **1** | Storage layer — full types, IStorage, FileStorage, MemoryStorage, WireframeManager (§7) | ✅ **Done** |
-| 2 | Operation Executor — streaming, parsers, retry, token tracker, two-AI pattern (§8) | ⏳ Not started |
+| **2** | Operation Executor — streaming, parsers, retry, token tracker, two-AI pattern (§8) | ✅ **Done** |
 | 3 | Context Builder — phase 1 + phase 2 context assembly, summarizer (§9) | ⏳ Not started |
 | 4 | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ⏳ Not started |
 | 5 | **Phase 1 Complete** — ops 1.0–1.3, prompts, API routes, **first usable demo** (§11) | ⏳ Not started |
@@ -116,18 +116,6 @@ These are deliberate omissions for Sprint 0 — each is flagged for a later spri
 2. **User messages require `timestamp: number`** in pi-ai's `Context.messages` — not just `{role, content}`. Missed on first pass, caught by `tsc`.
 3. **pi-ai's openai-completions transport rejects an empty API key** even for a custom baseUrl that doesn't authenticate. Workaround: pass `"ollama"` as a dummy for local models.
 4. **`qwen3.5:4b`** is the model tag locally installed. `qwen3:4b` is also present — swap via `OLLAMA_MODEL` env var.
-
----
-
-## Gaps Worth Watching (all sprints)
-
-These are systemic risks I want visible here rather than buried in the plan:
-
-- **pi-ai is pre-1.0** (0.67.1 as of this writing). Breaking changes are likely. We depend on: `stream`, `Context` shape, `getModel('groq', …)`, `Model<'openai-completions'>` custom model shape, `AssistantMessageEventStream` event types. Any of these shifting would ripple through the Operation Executor.
-- **No test infrastructure yet.** `vitest` is installed but no tests have been written. Sprint 1 must land at least a couple of unit tests around parsing and the executor, otherwise coverage debt compounds fast.
-- **Single-machine assumption.** Everything runs on localhost. No thought given to deploy, multi-user, or secret management beyond `.env.local`. Acceptable for the "local interface" phase of the project, but we should flag this if the product grows.
-- **No structured logging yet.** `console.log` implicit. Operation Executor will need structured logging in Sprint 1 to make production issues debuggable.
-- **pi-ai doesn't natively support Anthropic prompt caching via its unified interface in our code path** (we'd need provider-specific options). The implementation plan assumed cache_control would pass through — need to verify this survives the abstraction when we hit Sprint 6 batch ops.
 
 ---
 
@@ -260,6 +248,105 @@ Working persistence layer with full CRUD for every data model from the spec. Two
 
 ---
 
+## Sprint 2 — Detailed Record
+
+### Goal
+A working Operation Executor — the universal LLM-call layer every operation in the system will route through. It streams, parses structured outputs, retries on parse failure with corrective prompts, tracks tokens, and works equally against Groq (hosted) or Ollama (local) without any code changes.
+
+### Files created
+
+#### Operation executor module (`src/core/operation-executor/`)
+
+| Path | Contents |
+|---|---|
+| `executor.ts` | `OperationExecutor` class. Resolves models via `resolveModel(role)`, builds pi-ai `Context` with timestamp injection, streams events, accumulates text + usage, runs the op's parser, retries on parse failure with `buildRetryMessages`, returns `OperationResult<T>`. Honors per-op timeout via internal `AbortController` merged with caller's signal. `streamCall` is `protected` so unit tests can subclass and stub it. |
+| `parsers.ts` | `parseYAML`, `parseJSON`, `parseMarkdownSections`, `parsePlainText`, `extractGenerationContext`, `extractChangeContext`, `parseValidationResult`, `parseDriftResult`, `parseDiagnosisResult`. All pure functions returning `ParseResult<T>`. Shared `stripCodeFences` helper handles ` ```yaml `, ` ```json `, and bare ` ``` ` wrappings. |
+| `retry.ts` | `buildRetryMessages` — appends the failed assistant turn + a corrective user turn that quotes the parser error and the op-specific retry hint. |
+| `token-tracker.ts` | `TokenTracker` — in-memory per-session accumulator. Forwards pi-ai's reported cost rather than recomputing from a hardcoded price table (since pi-ai already knows). |
+| `streaming.ts` | `SSEWriter` + `createSSEResponse`. Standardized event vocabulary (`chunk`, `document`, `phase`, `progress`, `test_results`, `drift`, `meta`, `error`, `complete`). Used by every streaming API route in later sprints. |
+| `two-ai-pattern.ts` | `executeTwoAIPattern(executor, callA, callBFactory, contextExtractor)` — orchestrates the universal Two-AI flow used by ops 1.1, 1.2, 2.7a. Short-circuits Call B when Call A returns a clarifying question. |
+| `index.ts` | Barrel export for everything in the module. |
+
+#### Type system updates
+
+| Path | Change |
+|---|---|
+| `app/src/core/types/llm.ts` | Added `RoleName = "fast" \| "reasoning"`. Added `role?: RoleName` to `OperationDefinition` so ops can declare their model class without hard-coding a provider. |
+| `app/src/core/llm/providers.ts` | Re-exports `RoleName` from `@core/types`. Added `getApiKey(provider)` helper. **Critical fix:** added `compat: { thinkingFormat: "qwen-chat-template" }` to the Ollama model so pi-ai sends `chat_template_kwargs: { enable_thinking: false }` — without this, qwen3 family models burn 30+ seconds per call on internal reasoning. |
+
+#### Tests added
+
+| Path | Cases | Coverage |
+|---|---|---|
+| `src/core/operation-executor/__tests__/parsers.test.ts` | 36 | Every parser, happy + failure cases, code-fence handling, missing fields, clarifying-question detection, drift classifications, diagnosis types, validation PASS/FAIL with bullet lists |
+| `src/core/operation-executor/__tests__/token-tracker.test.ts` | 6 | Empty start, accumulation, session isolation, `reset(sessionId)`, `reset()`, copy semantics on getRecords |
+| `src/core/operation-executor/__tests__/two-ai-pattern.test.ts` | 4 | Happy path (Call A → extract → Call B), clarifying-question short-circuit, Call A failure, Call B failure |
+| `src/core/operation-executor/__tests__/executor.unit.test.ts` | 8 | Stubbed-streamCall executor: success-on-first-hit, retry-then-succeed, retry message context contents, retries-exhausted, no-retry-when-retryPrompt-null, transport-error-no-retry, sessionId token recording, no-recording-without-sessionId |
+| `src/core/operation-executor/__tests__/executor.integration.test.ts` | 4 | Real Ollama qwen3.5:4b — simple plain_text call, streaming chunks forwarded, retry-then-succeed against live model, token tracker accumulation across multiple live calls. Skip-gated via Ollama reachability + model presence check. |
+
+### Key design decisions made during Sprint 2
+
+1. **Adapted the plan's executor to pi-ai's actual API.** The plan's literal code referenced `claude-sonnet-4-6` defaults and an `@anthropic-ai/sdk`-shaped streaming loop. My implementation uses `resolveModel(role)` from `core/llm/providers` and pi-ai's `stream(model, context, options)` shape that I learned in Sprint 0.
+
+2. **Cost is forwarded, not recomputed.** The plan's `TokenTracker` had a hardcoded Anthropic price table and a `calculateCost` method. pi-ai already returns `usage.cost.total` per call from its internal model registry (zero for Ollama, accurate for hosted providers), so the tracker just sums what pi-ai reports. Less code, no drift between our table and pi-ai's.
+
+3. **Per-op timeout is enforced via `AbortController`, not `Promise.race`.** When an op declares `timeoutMs`, the executor sets a `setTimeout(abort, timeoutMs)` and merges the resulting signal with the caller's `signal` (if any) via a small `mergeSignals` helper. This properly cancels the underlying pi-ai stream rather than leaving an orphaned background request.
+
+4. **`streamCall` is `protected`, not `private`.** Unit tests subclass `OperationExecutor` to stub the network layer with a deterministic fake. This is more maintainable than `vi.spyOn` because TypeScript will catch renames at compile time.
+
+5. **Integration tests are skip-gated, not deleted.** `executor.integration.test.ts` checks Ollama reachability + model presence in `beforeAll`. If either is missing, every test in the file logs a skip warning and returns success. This means CI stays green on a machine without Ollama, but a developer with Ollama running gets real coverage.
+
+6. **The "exhausts retries" case is a unit test, not an integration test.** Originally I had it in the integration suite. Two sequential LLM calls on slow local hardware blew past any reasonable per-op timeout even with the thinking-disabled flag, so the test couldn't tell the difference between "executor correctly exhausted retries" and "executor correctly tripped the abort timeout". The unit-test version with a stubbed `streamCall` is deterministic, fast (5ms), and proves the same logic.
+
+7. **Disabling Qwen3 thinking mode is mandatory for usability.** Without `chat_template_kwargs: { enable_thinking: false }`, qwen3.5:4b spends 200+ tokens of internal chain-of-thought per call, taking 35+ seconds for a "say hi" prompt. With the flag, the model still emits some reasoning but completes in ~10s. This was discovered while debugging the integration test timeouts and is the kind of thing that wouldn't show up in unit tests at all.
+
+8. **Two-AI pattern returns the raw `OperationResult` for both calls.** Callers can drill into `callAResult.tokenUsage` and `callBResult.tokenUsage` for billing display, even though the `TwoAIResult` summary already has the human-readable parts.
+
+---
+
+## Testing Record — Sprint 2
+
+### What was tested
+
+| Check | Command | Result |
+|---|---|---|
+| TypeScript compilation | `npx tsc --noEmit` | ✅ 0 errors |
+| Non-integration test suite (Sprints 0/1/2) | `npx vitest run --exclude="**/*.integration.test.ts"` | ✅ **118/118** passing in 1.14s (6 files) |
+| Live Ollama integration suite | `npx vitest run src/core/operation-executor/__tests__/executor.integration.test.ts` | ✅ **4/4** passing in 228s against `qwen3.5:4b` |
+| Sprint 0 routes regression | `curl /api/health` | ✅ unchanged |
+
+### Test count breakdown (cumulative)
+
+- **Sprint 0:** 0 unit tests (proof-of-life routes only)
+- **Sprint 1:** 64 tests (57 storage + 7 wireframe)
+- **Sprint 2:** 58 tests (36 parsers + 6 token-tracker + 4 two-ai + 8 executor-unit + 4 executor-integration)
+- **Total:** **122 tests** (118 unit + 4 integration)
+
+### What was NOT tested (Sprint 2 blind spots)
+
+| Blind spot | Why not | Planned coverage |
+|---|---|---|
+| **Groq live calls** | No `GROQ_API_KEY` on machine. The Groq path is wired and `getApiKey("groq")` reads from env, but nothing has hit real Groq yet. | Sprint 5 — when ops 1.0–1.3 land, you can drop a key in `.env.local` and run the full Phase 1 flow against Groq. |
+| **Concurrent execute() calls on one TokenTracker** | Single-threaded tests only. Two simultaneous `execute()` calls writing to the same tracker would race on the internal `Map.set`. | Sprint 4 (Session Manager) — needs a per-session lock or atomic accumulator. Currently a known correctness gap if two SSE streams from the same session run concurrently. |
+| **AbortSignal cancellation mid-stream** | `signal` is wired through `executor → pi-ai`, but I never verified that aborting mid-stream cleanly stops the upstream HTTP request. The timeout path works (the integration test's earlier failure mode showed pi-ai surfacing "Request was aborted" correctly), but I didn't write a test that aborts a *running* operation from the caller side. | Sprint 3 — chat UI will need cancellation. Will add a test there. |
+| **Markdown sections with nested `##` inside a section** | The current parser splits on every `^## ` line. Nested headers (e.g. `## H2` inside a `## Outer` body) would prematurely end the outer section. | Real-world prompt design avoids nested H2 in document outputs, so this is unlikely to bite. Note in code if it does. |
+| **Diagnosis parser with multi-line root_cause containing `confidence:` substrings** | The field-stop regex looks for `confidence:` at the start of a line. If the model puts "we have low confidence:" inside the root_cause body, the parser will truncate. | Defer — can be tightened if real outputs trigger it. |
+| **Token tracker persistence** | Tracker is in-memory only. Restarting the dev server zeros all session totals. | Sprint 4 — Session Manager will own persistence; tracker may need a `flushTo(storage)` method. |
+| **Cost accuracy for Groq** | pi-ai's Groq model registry has price data baked in, but I haven't sanity-checked it against current Groq pricing. | Defer — first real Groq call will give us a number to compare. |
+| **`extractGenerationContext` with multiple context blocks** | The parser uses `indexOf`, which finds the first one. Multiple blocks would silently lose the rest. | Real prompts ask for exactly one block. Note in code if it ever appears. |
+| **Streaming backpressure** | `SSEWriter.send` enqueues without checking the controller's queue. A slow consumer could blow up memory. | Sprint 3 — chat UI will be the first real consumer; will add backpressure handling there. |
+| **Two-AI pattern with parser failures inside Call B** | Tested for "Call B failed" (executor returns failed status), but not specifically "Call B's parser failed but the executor retried and eventually succeeded". | Existing executor unit tests cover the retry path; the two-AI orchestrator just relays whatever execute() returns. Coverage is transitively complete. |
+
+### Known quirks discovered during Sprint 2
+
+1. **Qwen3 thinking mode is on by default.** Without `chat_template_kwargs: { enable_thinking: false }`, qwen3.5:4b takes 35+ seconds for a 2-word response. The `compat.thinkingFormat: "qwen-chat-template"` flag in providers.ts is critical for usability, not optional.
+2. **pi-ai's `Usage` interface requires `totalTokens` field** (not just `input` + `output`). Not documented anywhere obvious — caught by TS only after I tried to fake an assistant message in `toPiAiMessage`.
+3. **Vitest 4 changed `it()` signature.** Third positional arg is now `optionsOrTest`, not a number. Pass `{ timeout: ms }` as the second arg, or wrap in a helper that does so.
+4. **pi-ai's openai-completions transport STILL requires a non-empty apiKey** for Ollama. Quirk discovered in Sprint 0 — `getApiKey("ollama")` returns the literal string `"ollama"` to satisfy this.
+5. **`stream.result()` returns the final `AssistantMessage` but pi-ai also exposes `errorMessage` on it.** If a stream silently fails without emitting an `error` event, the only signal is `final.errorMessage`. The executor checks both paths.
+
+---
+
 ## Gaps Worth Watching (all sprints)
 
 These are systemic risks I want visible here rather than buried in the plan:
@@ -268,8 +355,9 @@ These are systemic risks I want visible here rather than buried in the plan:
 - **Single-machine assumption.** Everything runs on localhost. No thought given to deploy, multi-user, or secret management beyond `.env.local`. Acceptable for the "local interface" phase of the project, but we should flag this if the product grows.
 - **No structured logging yet.** `console.log` implicit. Operation Executor will need structured logging in Sprint 2 to make production issues debuggable.
 - **pi-ai doesn't natively support Anthropic prompt caching via its unified interface in our code path** (we'd need provider-specific options). The implementation plan assumed cache_control would pass through — need to verify this survives the abstraction when we hit Sprint 6 batch ops.
-- **No write locking on storage.** A single-user local app with one tab open is fine, but two concurrent SSE streams from the same session could race. Sprint 4 (Session Manager) needs a per-session async mutex.
+- **No write locking on storage OR token tracker.** A single-user local app with one tab open is fine, but two concurrent SSE streams from the same session could race on both `addMessage` and `TokenTracker.record`. Sprint 4 (Session Manager) needs a per-session async mutex.
 - **Path traversal in wireframe filenames** is not yet defended against. Must be sanitized in Sprint 8 when the wireframe-serving route lands.
+- **Qwen thinking-mode flag is provider-version-dependent.** The `chat_template_kwargs.enable_thinking` flag works on qwen3 family models served by recent Ollama releases. If the user upgrades Ollama or switches model, the flag may be ignored silently and ops will become 30-40s slow per call without any error. Watch for this when tuning models.
 
 ---
 
@@ -284,4 +372,6 @@ These are systemic risks I want visible here rather than buried in the plan:
 - **Ollama:** Running at `localhost:11434`. Models present: `qwen3.5:4b`, `qwen3:4b`, `embeddinggemma:latest`
 - **Active provider:** Ollama (`.env.local`)
 - **Groq API key:** Not set
-- **Test count:** 64 passing (57 storage + 7 wireframe)
+- **Test count:** 122 passing (118 unit + 4 live-Ollama integration)
+  - Sprint 1: 64 (57 storage + 7 wireframe)
+  - Sprint 2: 58 (36 parsers + 6 token-tracker + 4 two-ai + 8 executor-unit + 4 executor-integration)
