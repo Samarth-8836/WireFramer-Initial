@@ -55,7 +55,12 @@ export type ContextExtractor = (
   callAOutput: ParsedOutput,
 ) => ExtractedContext;
 
-export type CallBFactory = (contextData: unknown) => OperationDefinition;
+// The factory may be synchronous (most ops) or return a Promise<OperationDefinition>
+// when it has to await on storage or a context builder. The orchestrator
+// auto-awaits the result either way.
+export type CallBFactory = (
+  contextData: unknown,
+) => OperationDefinition | Promise<OperationDefinition>;
 
 export async function executeTwoAIPattern(
   executor: OperationExecutor,
@@ -85,7 +90,7 @@ export async function executeTwoAIPattern(
     };
   }
 
-  const callBDef = callBFactory(extracted.contextData);
+  const callBDef = await callBFactory(extracted.contextData);
   const callBResult = await executor.execute(callBDef, options);
 
   if (callBResult.status === "failed" || !callBResult.output) {
