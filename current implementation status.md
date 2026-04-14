@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-14
+**Last updated:** 2026-04-14 (Sprint 3 complete)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -15,7 +15,7 @@
 | **0** | Project setup — scaffold, deps, type stubs, LLM pipeline proof-of-life (§6) | ✅ **Done** |
 | **1** | Storage layer — full types, IStorage, FileStorage, MemoryStorage, WireframeManager (§7) | ✅ **Done** |
 | **2** | Operation Executor — streaming, parsers, retry, token tracker, two-AI pattern (§8) | ✅ **Done** |
-| 3 | Context Builder — phase 1 + phase 2 context assembly, summarizer (§9) | ⏳ Not started |
+| **3** | Context Builder — phase 1 + phase 2 context assembly, summarizer (§9) | ✅ **Done** |
 | 4 | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ⏳ Not started |
 | 5 | **Phase 1 Complete** — ops 1.0–1.3, prompts, API routes, **first usable demo** (§11) | ⏳ Not started |
 | 6 | Phase 2 auto-generation chain — ops 2.1–2.5 (§12) | ⏳ Not started |
@@ -347,6 +347,101 @@ A working Operation Executor — the universal LLM-call layer every operation in
 
 ---
 
+## Sprint 3 — Detailed Record
+
+### Goal
+A working Context Builder — the bridge between the (not-yet-built) Session Manager and the Operation Executor. For every operation, Session Manager knows WHAT to do; ContextBuilder knows WHAT CONTEXT that op needs; Operation Executor knows HOW to call the LLM. Sprint 3 delivers the middle layer plus the Summarizer (chat-history compression + running Phase 2 conversation log).
+
+### Files created
+
+#### Context builder module (`src/core/context-builder/`)
+
+| Path | Contents |
+|---|---|
+| `context-builder.ts` | `ContextBuilder` class. Takes `IStorage`, `IPromptRegistry`, `Summarizer` in constructor. One method per operation that needs context assembly: Phase 1 (first message, iteration, project contract doc gen, validation), Phase 2 auto-gen (workflow discovery, workflow detail, test case gen, screen extraction, HTML gen), Phase 2 interaction (conversational with optional screen reference), Drift check. Plus `updateConversationSummary` delegate. All methods return `{systemPrompt, messages: LLMMessage[]}` ready for the executor. |
+| `summarizer.ts` | `Summarizer` class. `processHistory(messages, budget)` — returns raw if under budget, otherwise summarizes older pairs via a `role: "fast"` executor call and keeps the last `RECENT_MESSAGE_PAIRS_TO_KEEP` (5) pairs verbatim. `updateConversationSummary(storage, sessionId, phaseId, iterNum, change, scope, affected)` — append-only log entry per iteration. Private helpers `estimateTokens` (~4 chars/token), `groupIntoPairs`, `summarizeMessages` (with fallback to truncation on executor failure). |
+| `phase2-context.ts` | `buildPhase2SystemContext(storage, sessionId, screenRef)` — the most complex assembly in the system (spec §6.2). Pulls contract + conversation summary + workflow map + screen inventory, emits a structured markdown system block. Helpers exported for direct use: `buildWorkflowSummary`, `buildScreenSummary`, `getFullScreenDetail`, `getWorkflowsForScreen`. Gracefully handles missing/malformed YAML. Uses `yaml.parse` with a try/catch wrapper. |
+| `index.ts` | Barrel export for `ContextBuilder`, `Summarizer`, all `phase2-context` helpers, and the `BuiltContext` type. |
+
+#### Prompt registry stub (`src/core/prompts/`)
+
+| Path | Contents |
+|---|---|
+| `prompt-registry.ts` | `PromptRegistry` + `IPromptRegistry` interface. Map-backed registry with `register(slug, content)`, `get(slug)` (throws on unknown slug), `has(slug)`. Sprint 5 will populate with real prompt bodies; Sprint 3 needs only the shape so `ContextBuilder` has a stable DI dependency. |
+| `index.ts` | Barrel export. |
+
+#### Tests added
+
+| Path | Cases | Coverage |
+|---|---|---|
+| `src/core/context-builder/__tests__/test-helpers.ts` | (non-test) | `FakeExecutor` (succeeds with canned summary, records calls), `FailingExecutor` (always fails — drives fallback path), `makeChat` (ChatMessage factory with configurable role + type), `seedContract` / `seedWorkflowMap` / `seedScreenInventory` (MemoryStorage seeders), `makeHarness` (one-stop-shop builder with fake prompts registered for all 10 slugs). |
+| `src/core/context-builder/__tests__/summarizer.test.ts` | 8 | Empty input → empty output. Under-budget → pass-through (no executor call). Over-budget with many pairs → summary system message prepended + last 5 pairs kept verbatim. Over-budget with few pairs → pass-through (no summary synthesized from the same messages we'd send anyway). Executor failure → truncated-concat fallback with ellipsis. Summarizer calls executor with `role: "fast"` and `plain_text` output format, sending OLDER messages only. `updateConversationSummary` creates new entry + appends to existing + increments `messagesCovered`. |
+| `src/core/context-builder/__tests__/phase2-context.test.ts` | 16 | `buildWorkflowSummary`: no workflows (empty YAML, missing key), full listing with metadata, recently-modified annotation based on summary text substring, malformed YAML graceful handling. `buildScreenSummary`: same set. `getFullScreenDetail`: match / no-match / empty. `getWorkflowsForScreen`: steps-containing / no-match. `buildPhase2SystemContext`: throws without contract, contract-only path, all-sections path with annotations, screen-ref with full detail + related workflows, screen-ref with unknown id falls back to no detail sections. |
+| `src/core/context-builder/__tests__/context-builder.test.ts` | 19 | Phase 1: first-message prompt + single message, iteration with filtered chat history, non-chat types excluded, doc generator is isolated (ignores history), validation contract-or-throw. Phase 2 auto-gen: workflow discovery / workflow detail / test case / screen extraction / screen HTML all embed the contract + their payload, throw when contract missing. Phase 2 conversational: with screenRef prefixes user message + includes full detail block, without screenRef uses raw message + no detail block, history flows between system context and new user turn. Drift check embeds contract + change context. `updateConversationSummary` delegate persists through to storage. |
+
+**Sprint 3 test count: 43 (8 summarizer + 16 phase2-context + 19 context-builder).**
+
+### Key design decisions made during Sprint 3
+
+1. **Summarizer owns the only LLM dependency in the subsystem.** `ContextBuilder` itself is pure + storage-I/O — the only async LLM call it makes is indirect, through `summarizer.processHistory`. This keeps the context assembly deterministic and testable against a fake summarizer, and concentrates the provider dependency in one place.
+
+2. **`PromptRegistry` is a Map-backed stub rather than deferred until Sprint 5.** The plan implies `ContextBuilder` depends on a "prompt registry" but doesn't specify its shape. The minimal interface — `register / get / has` with a Map backend — is enough to let Sprint 3 ship now and Sprint 5 populate it with real prompt bodies without changing the DI graph.
+
+3. **Document generators use ISOLATED context (no chat history) — spec §6.1.** `buildProjectContractGeneratorContext(generationContext)` takes only the `<generation_context>` string from Call A and wraps it as a single user message. This is deliberate: keeping doc generators deterministic relative to their input is what lets Sprint 7 run drift checks reliably. A test specifically seeds chat history and verifies the doc generator ignores it.
+
+4. **`processHistory` doesn't synthesize summaries for short histories.** If the message count is over the token budget but the pair count is ≤ `RECENT_MESSAGE_PAIRS_TO_KEEP`, we return the messages as-is. Synthesizing a summary from the same messages we'd have sent anyway is waste — the executor would see the summary AND the messages it summarizes. The honest path is to overflow and let the caller decide.
+
+5. **Recently-modified annotation uses a substring match against the conversation summary.** The plan says "workflows modified in last 3 iterations" but the conversation summary is free-form text. Rather than invent a structured diff format now, we scan the summary for workflow/screen IDs and annotate matches. This gives the LLM a weak but useful "this was discussed recently" signal. If Sprint 4/7 evolve the conversation summary to a structured log, both sides update together.
+
+6. **Malformed YAML in `structuredData` returns null, not throws.** Upstream ops could emit bad YAML (Sprint 6-7 generators haven't shipped yet, so we have no production data). Phase 2 context assembly shouldn't 500 on a data-quality problem — it returns "(no workflows)" / "(no screens)" so the LLM still gets a sensible system block with the contract + chat history.
+
+7. **Summarizer reuses `op-1-0` as its operationId.** Not accurate — it's a utility call, not op-1-0 (Phase 1 chat). Flagged as a blind spot. Sprint 4 may need a synthetic util id so summarizer tokens don't get attributed to the wrong operation in session-level analytics.
+
+8. **Pair grouping is dumb chunks of 2.** A "pair" is just two consecutive messages. With well-formed alternating user/assistant history this gives real turn pairs; with unbalanced history we still get sensible 2-message buckets for the "keep last N pairs" math. The count is what matters for the retention window, not the exact roles inside each bucket.
+
+---
+
+## Testing Record — Sprint 3
+
+### What was tested
+
+| Check | Command | Result |
+|---|---|---|
+| TypeScript compilation | `npx tsc --noEmit` | ✅ 0 errors |
+| Non-integration test suite (Sprints 0/1/2/3) | `npx vitest run --exclude="**/*.integration.test.ts"` | ✅ **161/161** passing in 1.4s (9 files) |
+| Live Ollama integration suite (regression) | `npx vitest run executor.integration.test.ts` | ✅ **4/4** passing in 386s (ran after Sprint 3 changes) |
+| Sprint 3 isolated run | `npx vitest run src/core/context-builder` | ✅ **43/43** passing in 4.4s |
+
+### Test count breakdown (cumulative)
+
+- **Sprint 0:** 0 unit tests
+- **Sprint 1:** 64 tests
+- **Sprint 2:** 58 tests
+- **Sprint 3:** 43 tests (8 summarizer + 16 phase2-context + 19 context-builder)
+- **Total:** **165 tests** (161 unit + 4 live-Ollama integration)
+
+### What was NOT tested (Sprint 3 blind spots)
+
+| Blind spot | Why not | Planned coverage |
+|---|---|---|
+| **Summarizer with real LLM** | Unit tests only — every executor call is a FakeExecutor return. A live summarization pass against Ollama is untested. | Sprint 5 demo — Phase 1 iteration with >20 turns will exercise the path. Add a skip-gated integration test if the fallback ever fires in production. |
+| **Phase 2 context with real generated YAML** | Tests use hand-written YAML fixtures. Sprint 6-7 ops will produce the real structuredData shape; schema drift between generators and the phase2-context parser would silently degrade the context. | Sprint 7 — add an end-to-end test that runs workflow discovery + screen extraction and then calls `buildPhase2SystemContext` on the result. |
+| **Concurrent updateConversationSummary** | Single-threaded tests only. Two concurrent Phase 2 iterations calling updateConversationSummary would race on the storage read-merge-write. | Sprint 4 — Session Manager owns iteration lifecycle and will need a per-session mutex around the whole iteration path, which includes the summary update. |
+| **Token counting for a real Groq summarizer** | Fake executor returns fixed `{input:10, output:5}`. Haven't verified that a real Groq summarization call produces sensible token numbers. | Sprint 5 — first real Groq summarization run. |
+| **Pair grouping when chat messages are non-alternating** | Tests use clean alternating user/assistant history. If real history has two user turns in a row (e.g. user resends), pair grouping would put them in the same bucket and lose a pair count. | Defer — real chat UI will enforce strict alternation in Sprint 5. |
+| **Token budget edge case: exactly at budget** | Tested under + over. Haven't tested `estimateTokens === budget` exactly. Current code uses `<=` so it would pass-through — behavior is correct, just not asserted. | Defer — trivial edge case. |
+| **`messagesCovered` semantics** | The field increments by 1 per `updateConversationSummary` call. Plan wasn't explicit on whether this should count user messages, iterations, or updates. Current behavior: one per update call. | Sprint 4 — Session Manager will decide the contract. |
+| **Phase2 context with only conversationSummary (no workflow map / inventory yet)** | Covered indirectly — the all-sections test exercises the opposite, and the contract-only test exercises the null path. A test that seeds contract + summary but no docs isn't explicit. | Low value — covered by combination of existing tests. |
+
+### Known quirks discovered during Sprint 3
+
+1. **`yaml.parse` in the `yaml` package returns `null` for empty strings and throws on malformed input.** The `safeParse` wrapper catches the throw and also short-circuits empty strings to avoid the wasted round-trip.
+2. **Vitest test-helper files must NOT match `*.test.ts`.** I named the shared harness `test-helpers.ts` (not `test-helpers.test.ts`) so Vitest's `include: ["src/**/*.test.ts"]` pattern skips it.
+3. **`ChatMessage.role` is `MessageRole = "user" | "assistant" | "system"`.** The Sprint 3 iteration spec treats `system` as a fourth kind that gets filtered upstream via `type`, but the TS type allows `role: "system"` on a `type: "chat"` message. The filter happens on `type`, not `role`, so a system-authored chat message would survive — unusual but not a bug.
+4. **The plan's literal summarizer code had `model: 'claude-haiku-4-5'` as a hard override.** We switched to `role: 'fast'` so the provider registry picks the cheap model on whichever provider is active. The plan was written against a hypothetical Anthropic-direct integration; our actual stack uses pi-ai + Groq/Ollama.
+
+---
+
 ## Gaps Worth Watching (all sprints)
 
 These are systemic risks I want visible here rather than buried in the plan:
@@ -372,6 +467,7 @@ These are systemic risks I want visible here rather than buried in the plan:
 - **Ollama:** Running at `localhost:11434`. Models present: `qwen3.5:4b`, `qwen3:4b`, `embeddinggemma:latest`
 - **Active provider:** Ollama (`.env.local`)
 - **Groq API key:** Not set
-- **Test count:** 122 passing (118 unit + 4 live-Ollama integration)
+- **Test count:** 165 passing (161 unit + 4 live-Ollama integration)
   - Sprint 1: 64 (57 storage + 7 wireframe)
   - Sprint 2: 58 (36 parsers + 6 token-tracker + 4 two-ai + 8 executor-unit + 4 executor-integration)
+  - Sprint 3: 43 (8 summarizer + 16 phase2-context + 19 context-builder)
