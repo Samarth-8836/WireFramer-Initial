@@ -26,6 +26,7 @@ export const PHASE2_PROMPT_SLUGS = {
   driftCheck: "drift-check",
   targetedScreenUpdate: "targeted-screen-update",
   targetedWorkflowUpdate: "targeted-workflow-update",
+  diagnosis: "test-failure-diagnosis",
 } as const;
 
 // Spec §17.5 — Operation 2.1a Workflow Discovery
@@ -579,6 +580,32 @@ If modifying steps, update edge cases that branch from the modified step if affe
 Produce the COMPLETE updated workflow definition in the same YAML format — including unchanged steps.`;
 }
 
+// Spec §17.25 — Op 2.9 Test Failure Diagnosis
+export function diagnosisPrompt(): string {
+  return `You are a test failure diagnostician. A test was run against a wireframe prototype and failed. Determine the root cause.
+
+You will receive:
+1. The test case in human-readable format
+2. The executable test steps
+3. The failure details (which step failed and the error)
+4. The HTML source of the screen where the failure occurred
+5. The workflow definition this test is based on
+
+Root cause must be exactly one of:
+
+WIREFRAME_BUG: The wireframe HTML is wrong. The test case and workflow are correct.
+TEST_BUG: The executable test automation is wrong. The wireframe and workflow are correct.
+WORKFLOW_FLAW: The workflow definition itself is flawed. Both wireframe and test correctly implement a flawed workflow.
+
+Respond:
+
+diagnosis: [WIREFRAME_BUG or TEST_BUG or WORKFLOW_FLAW]
+root_cause: [2-3 sentences explaining what went wrong]
+affected_artifact: [which specific file or document section is wrong]
+proposed_fix: [specific description of what needs to change]
+confidence: [high or medium or low]`;
+}
+
 // Seed a PromptRegistry with all Phase 2 prompts.
 export function registerPhase2Prompts(registry: IPromptRegistry): void {
   registry.register(PHASE2_PROMPT_SLUGS.workflowDiscovery, workflowDiscoveryPrompt());
@@ -602,4 +629,5 @@ export function registerPhase2Prompts(registry: IPromptRegistry): void {
   registry.register(PHASE2_PROMPT_SLUGS.driftCheck, driftCheckPrompt());
   registry.register(PHASE2_PROMPT_SLUGS.targetedScreenUpdate, targetedScreenUpdatePrompt());
   registry.register(PHASE2_PROMPT_SLUGS.targetedWorkflowUpdate, targetedWorkflowUpdatePrompt());
+  registry.register(PHASE2_PROMPT_SLUGS.diagnosis, diagnosisPrompt());
 }

@@ -52,3 +52,11 @@ export {
   executeTargetedScreenUpdate,
   executeTargetedWorkflowUpdate,
 } from "./op-2-7-targeted-updates";
+
+export { executeTestRun } from "./op-2-8-test-execution";
+
+export {
+  executeDiagnosis,
+  type DiagnosisInput,
+  type DiagnosisOutput,
+} from "./op-2-9-diagnosis";

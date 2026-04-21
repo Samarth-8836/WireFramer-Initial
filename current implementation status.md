@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-21 (Sprint 7 complete — Drift detection + cascade engine)
+**Last updated:** 2026-04-21 (Sprint 8 complete — Wireframe viewer + test execution)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -21,7 +21,7 @@
 | **5.5** | **Phase 1 UI shell** — Zustand stores, split-view, SSE client hook, document panel (§11 partial) | ✅ **Done** |
 | **6** | **Phase 2 auto-generation chain** — ops 2.1a–2.5e, 16 prompts, Phase2HandlersImpl, DAG wiring (§12) | ✅ **Done** |
 | **7** | **Drift detection + cascade engine** — ops 2.6, 2.7a-d, cascade router + executor (§13) | ✅ **Done** |
-| 8 | Wireframe viewer + test harness — ops 2.8, 2.9 (§14) | ⏳ Not started |
+| **8** | **Wireframe viewer + test execution** — ops 2.8, 2.9, wireframe serving, WireframeViewer, TestResultsPanel (§14) | ✅ **Done** |
 | 9 | Rollback + checkpoint system (§15) | ⏳ Not started |
 | 10 | Polish, error UX, performance (§16) | ⏳ Not started |
 | 11 | E2E tests + verification pass (§17) | ⏳ Not started |

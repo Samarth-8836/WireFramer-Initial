@@ -1,18 +1,24 @@
 "use client";
 
+import { useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { useDocumentStore } from "@stores/document-store";
+import { useSessionStore } from "@stores/session-store";
+import { WireframeViewer } from "./phase2/WireframeViewer";
 
 export function DocumentPanel() {
   const documents = useDocumentStore((s) => s.documents);
   const activeType = useDocumentStore((s) => s.activeDocumentType);
+  const phaseStates = useSessionStore((s) => s.phaseStates);
+  const [showWireframe, setShowWireframe] = useState(false);
 
   const activeDoc = activeType ? documents[activeType] : undefined;
+  const isPhase2 = phaseStates["phase-2"]?.status === "active";
 
   // Only show the panel when there's at least one document.
-  if (Object.keys(documents).length === 0) return null;
+  if (Object.keys(documents).length === 0 && !isPhase2) return null;
 
   return (
     <aside className="flex w-[45%] min-w-[320px] flex-col overflow-hidden bg-white dark:bg-zinc-900">
@@ -23,21 +29,36 @@ export function DocumentPanel() {
             <TabButton
               key={type}
               label={formatDocType(type)}
-              active={type === activeType}
-              onClick={() =>
+              active={type === activeType && !showWireframe}
+              onClick={() => {
+                setShowWireframe(false);
                 useDocumentStore
                   .getState()
                   .setActiveDocumentType(
                     type as import("@core/types").DocumentType,
-                  )
-              }
+                  );
+              }}
             />
           ) : null,
         )}
+        {isPhase2 && (
+          <TabButton
+            label="Wireframe"
+            active={showWireframe}
+            onClick={() => setShowWireframe(true)}
+          />
+        )}
       </div>
 
+      {/* Wireframe view */}
+      {showWireframe && (
+        <div className="flex-1 overflow-hidden">
+          <WireframeViewer />
+        </div>
+      )}
+
       {/* Document content */}
-      <div className="flex-1 overflow-y-auto px-6 py-4">
+      {!showWireframe && <div className="flex-1 overflow-y-auto px-6 py-4">
         {activeDoc ? (
           <>
             <div className="mb-4 flex items-center justify-between">
@@ -59,7 +80,7 @@ export function DocumentPanel() {
             Select a document to view.
           </p>
         )}
-      </div>
+      </div>}
     </aside>
   );
 }
