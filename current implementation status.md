@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-15 (Sprint 5 complete — Phase 1 backend shipped)
+**Last updated:** 2026-04-21 (Sprint 5.5 complete — Phase 1 UI shell shipped)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -18,7 +18,7 @@
 | **3** | Context Builder — phase 1 + phase 2 context assembly, summarizer (§9) | ✅ **Done** |
 | **4** | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ✅ **Done** |
 | **5** | **Phase 1 backend** — ops 1.0–1.3, prompts, API routes (§11 partial — UI deferred to Sprint 5.5) | ✅ **Done** |
-| 5.5 | Phase 1 UI shell — Zustand stores, split-view, streaming client, document panel | ⏳ Not started |
+| **5.5** | **Phase 1 UI shell** — Zustand stores, split-view, SSE client hook, document panel (§11 partial) | ✅ **Done** |
 | 6 | Phase 2 auto-generation chain — ops 2.1–2.5 (§12) | ⏳ Not started |
 | 7 | Drift detection + cascade engine — ops 2.6, 2.7 (§13) | ⏳ Not started |
 | 8 | Wireframe viewer + test harness — ops 2.8, 2.9 (§14) | ⏳ Not started |
@@ -729,11 +729,87 @@ These are systemic risks I want visible here rather than buried in the plan:
 - **Vitest:** 4.1.4
 - **pi-ai:** `@mariozechner/pi-ai@0.67.1` (resolved via `^0.67.1` — minor breaking changes will surface as test failures)
 - **Ollama:** Running at `localhost:11434`. Models present: `qwen3.5:4b`, `qwen3:4b`, `embeddinggemma:latest`
-- **Active provider:** Ollama (`.env.local`)
-- **Groq API key:** Not set
+- **Active provider:** Groq (`.env.local`) — `openai/gpt-oss-120b` for both fast + reasoning
+- **Groq API key:** Set in `.env.local`
 - **Test count:** 221 passing (217 unit + 4 live-Ollama integration)
   - Sprint 1: 64 (57 storage + 7 wireframe)
   - Sprint 2: 58 (36 parsers + 6 token-tracker + 4 two-ai + 8 executor-unit + 4 executor-integration)
   - Sprint 3: 43 (8 summarizer + 16 phase2-context + 19 context-builder)
   - Sprint 4: 46 (14 state machine + 3 router + 12 DAG + 4 auto-gen + 13 session manager)
   - Sprint 5: 10 (5 op-1-0 + 5 phase1-handlers)
+  - Sprint 5.5: 0 new tests (UI components — verified via browser + tsc)
+
+---
+
+## Sprint 5.5 — Detailed Record
+
+### Goal
+Phase 1 visually usable in a browser. Three-zone layout with session sidebar, chat panel with streaming, and document panel rendering the Project Contract as markdown. All connected to the Sprint 5 backend via SSE.
+
+### Files created
+
+#### Zustand stores (`src/stores/`)
+
+| Path | Contents |
+|---|---|
+| `session-store.ts` | `useSessionStore` — session list, active session ID, phase states, `loadSessions` (fetches GET `/api/sessions`), `setActiveSession` (fetches GET `/api/sessions/[id]` snapshot, hydrates phase states), `addSession` / `updateSessionTitle` / `clearActive`. Returns typed `SessionSnapshot` from setActiveSession for sidebar hydration. |
+| `chat-store.ts` | `useChatStore` — message list, streaming text accumulator, `isStreaming`/`isBlocked` flags, error state. `startStreaming` → `appendStreamChunk` → `finalizeStream` lifecycle for SSE consumption. `loadMessages` for hydrating from a session snapshot. |
+| `document-store.ts` | `useDocumentStore` — document map keyed by `DocumentType`, active document type selection. `setDocument` (upsert), `loadDocuments` (batch hydrate from snapshot). Auto-selects first document type when none is active. |
+
+#### SSE client hook (`src/lib/`)
+
+| Path | Contents |
+|---|---|
+| `use-sse.ts` | `useSSE()` hook returning `{ sendMessage, completePhase }`. Uses fetch-based SSE consumer (not EventSource — POST with body is required). Parses SSE frames (`event: TYPE\ndata: JSON\n\n`), dispatches to all three stores. Handles: `chunk` → chat accumulator, `document` → document store, `meta.session_info` → session store + sidebar refresh, `phase` → phase state update, `test_results` → system message, `error` → chat error, `complete` → finalize stream. Supports abort via AbortController. Adds optimistic user message before streaming starts. |
+
+#### React components (`src/components/`)
+
+| Path | Contents |
+|---|---|
+| `AppShell.tsx` | Three-zone layout: 240px sidebar, flex chat panel, 45% document panel (conditionally rendered when documents exist). Loads session list on mount. Phase indicator shown when a session is active. |
+| `SessionSidebar.tsx` | Session list sorted by updatedAt. "New Chat" button clears active state. Session click hydrates chat messages + documents from the `/api/sessions/[id]` snapshot. Active session highlighted with blue. Relative time display (just now / Xm ago / Xh ago / Xd ago). |
+| `PhaseIndicator.tsx` | Horizontal phase flow: Phase 1 (Define) → Phase 2 (Generate). Color-coded dots: blue ring = active, green = complete, gray = not started. Reads from session store phase states. |
+| `ChatPanel.tsx` | Scrollable message list with user (blue, right-aligned) and assistant (white, left-aligned) bubbles. System messages (amber, centered). Streaming response with blinking cursor. Typing indicator (bouncing dots) when streaming starts before text arrives. Error display (red banner). Auto-scroll on new content. Empty state with product description prompt when no session active. |
+| `ChatInput.tsx` | Auto-growing textarea (max 120px). Enter to send, Shift+Enter for newline. Disabled when blocked. "Done — Validate & Complete Phase 1" button shown when phase-1 is active. Calls `useSSE().sendMessage` and `useSSE().completePhase`. |
+| `DocumentPanel.tsx` | Right panel rendering active document via react-markdown + remark-gfm. Tab bar for switching between document types. Version badge. Manual markdown styles in globals.css (Turbopack incompatible with `@tailwindcss/typography` `@plugin` directive). |
+
+#### Updated files
+
+| Path | Change |
+|---|---|
+| `src/app/page.tsx` | Replaced Next.js boilerplate with `<AppShell />` |
+| `src/app/layout.tsx` | Updated metadata title to "UX Builder" |
+| `src/app/globals.css` | Added scrollbar theming + `.markdown-body` styles for headings, lists, code, tables, blockquotes. Dark mode support via `prefers-color-scheme`. |
+| `package.json` | Added `@tailwindcss/typography` (installed but not used via `@plugin` due to Turbopack crash — CSS styles are manual instead). |
+
+### Key design decisions made during Sprint 5.5
+
+1. **Fetch-based SSE, not EventSource.** `EventSource` only supports GET. Our `/api/chat` is POST with a JSON body. Using `fetch` + `ReadableStream.getReader()` gives full control over the request shape while still parsing SSE frames.
+
+2. **Optimistic user message.** The user message appears in the chat immediately before the server responds. This makes the UI feel instant even though the SSE stream takes 1-2s to start. The message has a temporary `id` (`temp-<timestamp>`) — it's never reconciled with the server-persisted message because the session snapshot on reload replaces all messages anyway.
+
+3. **Three stores, not one.** The plan's §26 showed a single store with sub-slices. Three separate stores (session, chat, document) is cleaner with Zustand 5 — each component subscribes only to the slice it needs, avoiding unnecessary re-renders.
+
+4. **Manual markdown styles instead of `@tailwindcss/typography`.** Turbopack crashes (`0xc0000142` exit code) when the `@plugin "@tailwindcss/typography"` directive is processed via PostCSS in `globals.css`. Rather than switching away from Turbopack (which is the default in Next.js 16), I wrote manual `.markdown-body` CSS rules. They cover the essential typography (h1-h3, p, ul/ol, code, pre, table, blockquote, hr) with dark mode support. The `@tailwindcss/typography` package remains installed for potential future use with a different build tool.
+
+5. **Session hydration happens in the sidebar.** When the user clicks a session, `setActiveSession` fetches the full snapshot (session + phase states + documents + messages) and returns it as `SessionSnapshot`. The sidebar handler then dispatches to both `useChatStore.loadMessages` and `useDocumentStore.loadDocuments`. This keeps the session store focused on session-level state while the sidebar orchestrates the cross-store hydration.
+
+6. **Document panel conditionally renders.** When no documents exist (new session, empty state), the document panel is completely absent — the chat panel takes full width. As soon as the first document event arrives via SSE, the panel slides in at 45% width. This gives the initial chat experience more breathing room.
+
+### What was NOT tested (Sprint 5.5 blind spots)
+
+| Blind spot | Why not | Planned coverage |
+|---|---|---|
+| **Browser rendering fidelity** | Verified via curl + tsc + dev server 200 status, but not opened in an actual browser during this session. Component structure and Tailwind classes are correct by construction, but visual regressions (overlap, scrollbar, dark mode) need a visual check. | User should open `http://localhost:3000` and walk through: new chat → streaming response → document panel → session switching. |
+| **SSE reconnection on network drop** | The fetch-based consumer doesn't retry on connection loss. A dropped connection during streaming will show the partial response and stop. | Sprint 10 polish — add a retry with exponential backoff on fetch failure. |
+| **Session switching during active stream** | Clicking a different session while a response is streaming will abort the current stream (via AbortController) and hydrate the new session. The abort path is coded but untested in a real browser. | Manual browser test. |
+| **Dark mode** | CSS includes dark mode rules via `prefers-color-scheme` and dark: Tailwind variants, but the visual result hasn't been verified. | Manual browser test with system dark mode on. |
+| **Mobile / responsive layout** | The three-zone layout uses fixed widths. On narrow viewports, sidebar and document panel will overflow. | Sprint 10 polish — add responsive breakpoints or a collapse toggle. |
+| **Keyboard accessibility** | Enter/Shift+Enter work in ChatInput, but focus management, tab order, and screen reader support haven't been tested. | Sprint 10 polish. |
+| **Phase completion UI flow** | "Done" button calls `completePhase` which streams back validation results. The test_results SSE event becomes a system message. Not tested in browser. | Manual browser test — click Done after iterating on a contract. |
+
+### Known quirks discovered during Sprint 5.5
+
+1. **Turbopack crashes with `@plugin` CSS directive.** The `@plugin "@tailwindcss/typography"` directive triggers a PostCSS child-process crash (`0xc0000142`) in Next.js 16.2.3 + Turbopack on Windows. This is a Turbopack bug, not a Tailwind bug — the same directive works with `next build` (webpack). Workaround: manual CSS styles.
+2. **Port conflict on dev server restart.** The dev server may pick port 3001 if a previous instance on 3000 is still running. The `--turbopack` flag (default in Next 16) doesn't auto-kill prior instances.
+3. **`setActiveSession` needed a return type.** Initially typed as `Promise<void>`, but the sidebar needed the snapshot data to hydrate chat + documents. Fixed by adding `SessionSnapshot` return type. This is a general pattern: Zustand actions that fetch data should return it for the caller to use, not just set internal state.

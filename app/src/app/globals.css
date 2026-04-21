@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
+  --background: #fafafa;
   --foreground: #171717;
 }
 
@@ -22,5 +22,43 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+/* Hide scrollbar for clean look, keep scrollability */
+.overflow-y-auto {
+  scrollbar-width: thin;
+  scrollbar-color: #d4d4d8 transparent;
+}
+
+.dark .overflow-y-auto {
+  scrollbar-color: #3f3f46 transparent;
+}
+
+/* Markdown body styles (replacement for @tailwindcss/typography) */
+.markdown-body h1 { font-size: 1.5rem; font-weight: 700; margin: 1.5rem 0 0.75rem; line-height: 1.3; }
+.markdown-body h2 { font-size: 1.25rem; font-weight: 600; margin: 1.25rem 0 0.5rem; line-height: 1.35; }
+.markdown-body h3 { font-size: 1.1rem; font-weight: 600; margin: 1rem 0 0.5rem; line-height: 1.4; }
+.markdown-body p { margin: 0.5rem 0; line-height: 1.65; }
+.markdown-body ul, .markdown-body ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+.markdown-body ul { list-style-type: disc; }
+.markdown-body ol { list-style-type: decimal; }
+.markdown-body li { margin: 0.25rem 0; line-height: 1.6; }
+.markdown-body strong { font-weight: 600; }
+.markdown-body code { font-family: var(--font-mono), monospace; font-size: 0.85em; background: #f4f4f5; padding: 0.15em 0.35em; border-radius: 0.25rem; }
+.markdown-body pre { background: #f4f4f5; padding: 0.75rem 1rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.75rem 0; }
+.markdown-body pre code { background: none; padding: 0; }
+.markdown-body blockquote { border-left: 3px solid #d4d4d8; padding-left: 1rem; margin: 0.75rem 0; color: #71717a; }
+.markdown-body hr { border: none; border-top: 1px solid #e4e4e7; margin: 1.5rem 0; }
+.markdown-body table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; }
+.markdown-body th, .markdown-body td { border: 1px solid #e4e4e7; padding: 0.4rem 0.75rem; text-align: left; }
+.markdown-body th { background: #f4f4f5; font-weight: 600; }
+
+@media (prefers-color-scheme: dark) {
+  .markdown-body code { background: #27272a; }
+  .markdown-body pre { background: #27272a; }
+  .markdown-body blockquote { border-left-color: #3f3f46; color: #a1a1aa; }
+  .markdown-body hr { border-top-color: #3f3f46; }
+  .markdown-body th, .markdown-body td { border-color: #3f3f46; }
+  .markdown-body th { background: #27272a; }
 }
