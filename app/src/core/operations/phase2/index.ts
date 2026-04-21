@@ -37,3 +37,18 @@ export {
   executeTestRepair,
   type DryRunResult,
 } from "./op-2-5-tests";
+
+export {
+  executeDriftCheck,
+  type DriftCheckResult,
+} from "./op-2-6-drift-check";
+
+export {
+  executePhase2Conversational,
+  type Phase2ConversationalResult,
+} from "./op-2-7a-conversational";
+
+export {
+  executeTargetedScreenUpdate,
+  executeTargetedWorkflowUpdate,
+} from "./op-2-7-targeted-updates";

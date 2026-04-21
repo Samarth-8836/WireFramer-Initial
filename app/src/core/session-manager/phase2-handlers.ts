@@ -1,10 +1,15 @@
 import { parse as parseYamlLib } from "yaml";
 import { v4 as uuidv4 } from "uuid";
 
+import type { ContextBuilder } from "@core/context-builder";
 import type { OperationExecutor, SSEWriter } from "@core/operation-executor";
 import type { IPromptRegistry } from "@core/prompts";
 import type { IStorage } from "@core/storage";
 import { WireframeManager } from "@core/wireframe/wireframe-manager";
+import {
+  executeDriftCheck,
+  executePhase2Conversational,
+} from "@core/operations/phase2";
 import {
   executeWorkflowDiscovery,
   executeWorkflowDetailBatch,
@@ -29,6 +34,8 @@ import {
 
 import type { AutoGenRunners, AutoGenConditions } from "./auto-generation-graph";
 import { buildAutoGenerationGraph } from "./auto-generation-graph";
+import { CascadeExecutor } from "./cascade-executor";
+import { routeCascade } from "./cascade-router";
 import { DependencyGraphExecutor } from "./dependency-graph";
 import { transitionPhase } from "./phase-state-machine";
 import type { Phase2Handlers } from "./session-manager";
@@ -37,6 +44,7 @@ interface Phase2Deps {
   storage: IStorage;
   executor: OperationExecutor;
   promptRegistry: IPromptRegistry;
+  contextBuilder: ContextBuilder;
   dataDir: string;
 }
 
@@ -137,18 +145,133 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     }
   }
 
-  // Phase 2 conversational — Sprint 7 (drift detection + cascade).
+  // Phase 2 conversational — full drift detection + cascade flow.
   async handleMessage(
-    _sessionId: string,
-    _message: string,
-    _screenRef: string | null,
+    sessionId: string,
+    message: string,
+    screenRef: string | null,
     sse: SSEWriter,
   ): Promise<void> {
-    sse.sendError(
-      "Phase 2 conversational interaction is not yet implemented (Sprint 7).",
-      true,
+    const { storage, executor, contextBuilder, promptRegistry, dataDir } =
+      this.deps;
+
+    // 1. Op 2.7a — Conversational AI.
+    const conversational = await executePhase2Conversational(
+      executor,
+      contextBuilder,
+      sessionId,
+      message,
+      screenRef,
+      sse,
     );
-    sse.close();
+
+    // Persist user + assistant messages.
+    await storage.addMessage({
+      id: uuidv4(),
+      sessionId,
+      phaseId: "phase-2",
+      role: "user",
+      type: "chat",
+      content: message,
+      metadata: {
+        screenReference: screenRef,
+        generationContext: null,
+        operationId: "op-2-7a",
+        stale: false,
+      },
+      createdAt: new Date().toISOString(),
+    });
+
+    await storage.addMessage({
+      id: uuidv4(),
+      sessionId,
+      phaseId: "phase-2",
+      role: "assistant",
+      type: "chat",
+      content: conversational.visibleResponse,
+      metadata: {
+        screenReference: null,
+        generationContext: conversational.changeContextRaw,
+        operationId: "op-2-7a",
+        stale: false,
+      },
+      createdAt: new Date().toISOString(),
+    });
+
+    // 2. If clarifying question — stop here.
+    if (conversational.isClarifyingQuestion) {
+      sse.sendComplete({ event: "clarifying_question" });
+      return;
+    }
+
+    // 3. Op 2.6 — Drift check.
+    if (conversational.changeContextRaw) {
+      const driftResult = await executeDriftCheck(
+        executor,
+        contextBuilder,
+        sessionId,
+        conversational.changeContextRaw,
+      );
+
+      if (driftResult.classification === "DRIFT") {
+        sse.send({
+          type: "drift",
+          data: {
+            classification: "DRIFT",
+            type: driftResult.type,
+            reason: driftResult.reason,
+          },
+        });
+        sse.sendComplete({ event: "drift_blocked" });
+        return;
+      }
+
+      if (driftResult.classification === "FLAG") {
+        sse.send({
+          type: "drift",
+          data: {
+            classification: "FLAG",
+            type: driftResult.type,
+            reason: driftResult.reason,
+          },
+        });
+        // For now, proceed anyway. The UI will show a warning banner
+        // and let the user choose. A full implementation would wait
+        // for user confirmation before continuing.
+      }
+    }
+
+    // 4. Op 2.7b — Cascade routing.
+    if (!conversational.changeContextParsed) {
+      sse.sendComplete({ event: "no_changes" });
+      return;
+    }
+
+    const route = routeCascade(conversational.changeContextParsed);
+
+    sse.sendProgress({
+      operationId: "cascade",
+      status: "in_progress",
+      detail: `Applying ${route.scope} change: ${route.description}`,
+    });
+
+    // 5. Execute cascade.
+    const cascadeExecutor = new CascadeExecutor({
+      storage,
+      executor,
+      promptRegistry,
+      dataDir,
+    });
+
+    await cascadeExecutor.execute(sessionId, route, sse);
+
+    sse.sendProgress({
+      operationId: "cascade",
+      status: "complete",
+      detail: "Changes applied",
+    });
+
+    sse.sendComplete({ event: "cascade_complete" });
   }
 
   // Phase 2 completion — Sprint 10 (export + validation).

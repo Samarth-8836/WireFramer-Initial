@@ -81,6 +81,7 @@ export function getBootstrap(options: BootstrapOptions = {}): Bootstrapped {
     storage,
     executor,
     promptRegistry,
+    contextBuilder,
     dataDir,
   });
 
