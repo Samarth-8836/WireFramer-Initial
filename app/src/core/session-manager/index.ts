@@ -6,6 +6,7 @@ export {
 } from "./session-manager";
 export { Phase1HandlersImpl, type Phase1HandlerDeps } from "./phase1-handlers";
 export { Phase2HandlersStub } from "./phase2-handlers-stub";
+export { Phase2HandlersImpl } from "./phase2-handlers";
 export {
   validateTransition,
   transitionPhase,

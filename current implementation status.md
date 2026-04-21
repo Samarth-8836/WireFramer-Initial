@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-21 (Sprint 5.5 complete — Phase 1 UI shell shipped)
+**Last updated:** 2026-04-21 (Sprint 6 complete — Phase 2 auto-generation chain)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -19,7 +19,7 @@
 | **4** | Session Manager — coordinator, phase state machine, op router, dependency graph (§10) | ✅ **Done** |
 | **5** | **Phase 1 backend** — ops 1.0–1.3, prompts, API routes (§11 partial — UI deferred to Sprint 5.5) | ✅ **Done** |
 | **5.5** | **Phase 1 UI shell** — Zustand stores, split-view, SSE client hook, document panel (§11 partial) | ✅ **Done** |
-| 6 | Phase 2 auto-generation chain — ops 2.1–2.5 (§12) | ⏳ Not started |
+| **6** | **Phase 2 auto-generation chain** — ops 2.1a–2.5e, 16 prompts, Phase2HandlersImpl, DAG wiring (§12) | ✅ **Done** |
 | 7 | Drift detection + cascade engine — ops 2.6, 2.7 (§13) | ⏳ Not started |
 | 8 | Wireframe viewer + test harness — ops 2.8, 2.9 (§14) | ⏳ Not started |
 | 9 | Rollback + checkpoint system (§15) | ⏳ Not started |
@@ -813,3 +813,5 @@ Phase 1 visually usable in a browser. Three-zone layout with session sidebar, ch
 1. **Turbopack crashes with `@plugin` CSS directive.** The `@plugin "@tailwindcss/typography"` directive triggers a PostCSS child-process crash (`0xc0000142`) in Next.js 16.2.3 + Turbopack on Windows. This is a Turbopack bug, not a Tailwind bug — the same directive works with `next build` (webpack). Workaround: manual CSS styles.
 2. **Port conflict on dev server restart.** The dev server may pick port 3001 if a previous instance on 3000 is still running. The `--turbopack` flag (default in Next 16) doesn't auto-kill prior instances.
 3. **`setActiveSession` needed a return type.** Initially typed as `Promise<void>`, but the sidebar needed the snapshot data to hydrate chat + documents. Fixed by adding `SessionSnapshot` return type. This is a general pattern: Zustand actions that fetch data should return it for the caller to use, not just set internal state.
+4. **SSR hydration mismatch with Zustand stores.** Server-rendering `AppShell` produces HTML with empty store state, but the client hydration path + Turbopack chunking causes React to fail silently — event handlers never attach, buttons don't work, sessions don't load. Fix: `page.tsx` uses `next/dynamic` with `ssr: false` to render the entire app shell client-only. Since this is a SPA-like tool (no SEO needed), SSR adds no value anyway.
+5. **`ssr: false` in `next/dynamic` requires `"use client"` in Next.js 16.** A Server Component cannot use `dynamic(..., { ssr: false })`. The page must be marked `"use client"` first.

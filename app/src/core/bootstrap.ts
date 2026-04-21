@@ -2,10 +2,14 @@ import path from "node:path";
 
 import { ContextBuilder, Summarizer } from "@core/context-builder";
 import { OperationExecutor } from "@core/operation-executor";
-import { PromptRegistry, registerPhase1Prompts } from "@core/prompts";
+import {
+  PromptRegistry,
+  registerPhase1Prompts,
+  registerPhase2Prompts,
+} from "@core/prompts";
 import {
   Phase1HandlersImpl,
-  Phase2HandlersStub,
+  Phase2HandlersImpl,
   SessionManager,
 } from "@core/session-manager";
 import { FileStorage } from "@core/storage";
@@ -51,14 +55,14 @@ export function getSessionManager(options: BootstrapOptions = {}): SessionManage
 export function getBootstrap(options: BootstrapOptions = {}): Bootstrapped {
   if (cached) return cached;
 
-  const storage =
-    options.storage ??
-    new FileStorage(options.dataDir ?? path.resolve(process.cwd(), "data"));
+  const dataDir = options.dataDir ?? path.resolve(process.cwd(), "data");
+  const storage = options.storage ?? new FileStorage(dataDir);
 
   const executor = new OperationExecutor();
 
   const promptRegistry = new PromptRegistry();
   registerPhase1Prompts(promptRegistry);
+  registerPhase2Prompts(promptRegistry);
 
   const summarizer = new Summarizer(executor);
   const contextBuilder = new ContextBuilder(
@@ -73,7 +77,12 @@ export function getBootstrap(options: BootstrapOptions = {}): Bootstrapped {
     contextBuilder,
     promptRegistry,
   });
-  const phase2Handlers = new Phase2HandlersStub();
+  const phase2Handlers = new Phase2HandlersImpl({
+    storage,
+    executor,
+    promptRegistry,
+    dataDir,
+  });
 
   const sessionManager = new SessionManager(storage, {
     phase1: phase1Handlers,
