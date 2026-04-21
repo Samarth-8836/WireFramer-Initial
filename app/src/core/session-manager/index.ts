@@ -30,3 +30,12 @@ export {
   type AutoGenRunners,
   type AutoGenConditions,
 } from "./auto-generation-graph";
+export {
+  hasContractChanged,
+  executeRollback,
+  handlePhase1ReCompletion,
+  restorePhase2,
+  createPhase1CompletionCheckpoint,
+} from "./rollback";
+export { routeCascade, type CascadeScope, type CascadeRoute } from "./cascade-router";
+export { CascadeExecutor } from "./cascade-executor";

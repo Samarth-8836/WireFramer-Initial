@@ -25,7 +25,7 @@ const VALID_TRANSITIONS: Record<PhaseStatus, readonly PhaseStatus[]> = {
   not_started: ["active"],
   active: ["completing", "suspended"],
   completing: ["complete", "active"],
-  complete: [],
+  complete: ["active"],  // Rollback: allows re-entering a phase (Sprint 9)
   suspended: ["active"],
 };
 
@@ -69,8 +69,13 @@ export async function transitionPhase(
   if (newStatus === "active") {
     // Restoring from suspended also refreshes enteredAt so the UI can
     // reason about "how long have we been back in this phase".
-    if (current.status === "not_started" || current.status === "suspended") {
+    if (
+      current.status === "not_started" ||
+      current.status === "suspended" ||
+      current.status === "complete"  // Rollback re-entry
+    ) {
       next.enteredAt = now;
+      next.completedAt = null;  // Clear completion on re-entry
     }
     // Leaving `completing -> active` (on validation FAIL) does NOT reset
     // enteredAt, since we never really left the active window.

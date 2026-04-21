@@ -31,8 +31,8 @@ describe("validateTransition", () => {
     expect(validateTransition("active", "complete")).toBe(false);
   });
 
-  it("rejects complete -> * (complete is terminal)", () => {
-    expect(validateTransition("complete", "active")).toBe(false);
+  it("allows complete -> active (rollback) but rejects other transitions from complete", () => {
+    expect(validateTransition("complete", "active")).toBe(true);
     expect(validateTransition("complete", "completing")).toBe(false);
     expect(validateTransition("complete", "suspended")).toBe(false);
     expect(validateTransition("complete", "not_started")).toBe(false);
