@@ -1,6 +1,6 @@
 # UX Builder — Current Implementation Status
 
-**Last updated:** 2026-04-21 (Sprint 9 complete — Rollback + checkpoint system)
+**Last updated:** 2026-04-22 (Sprint 10 complete — Polish, error UX, session management)
 **Plan reference:** `implementation-plan.md` (30 sections, 3,730 lines)
 **Spec reference:** `implementation-reference-v1.md`
 
@@ -23,7 +23,7 @@
 | **7** | **Drift detection + cascade engine** — ops 2.6, 2.7a-d, cascade router + executor (§13) | ✅ **Done** |
 | **8** | **Wireframe viewer + test execution** — ops 2.8, 2.9, wireframe serving, WireframeViewer, TestResultsPanel (§14) | ✅ **Done** |
 | **9** | **Rollback + checkpoint system** — contract comparison, rollback orchestration, Phase 2 restore/regen (§15) | ✅ **Done** |
-| 10 | Polish, error UX, performance (§16) | ⏳ Not started |
+| **10** | **Polish, error UX, session management** — Op 2.10 validation, Phase 2 completion, session resume, export API, DriftWarning, ErrorBoundary (§16) | ✅ **Done** |
 | 11 | E2E tests + verification pass (§17) | ⏳ Not started |
 
 ---
@@ -815,3 +815,70 @@ Phase 1 visually usable in a browser. Three-zone layout with session sidebar, ch
 3. **`setActiveSession` needed a return type.** Initially typed as `Promise<void>`, but the sidebar needed the snapshot data to hydrate chat + documents. Fixed by adding `SessionSnapshot` return type. This is a general pattern: Zustand actions that fetch data should return it for the caller to use, not just set internal state.
 4. **SSR hydration mismatch with Zustand stores.** Server-rendering `AppShell` produces HTML with empty store state, but the client hydration path + Turbopack chunking causes React to fail silently — event handlers never attach, buttons don't work, sessions don't load. Fix: `page.tsx` uses `next/dynamic` with `ssr: false` to render the entire app shell client-only. Since this is a SPA-like tool (no SEO needed), SSR adds no value anyway.
 5. **`ssr: false` in `next/dynamic` requires `"use client"` in Next.js 16.** A Server Component cannot use `dynamic(..., { ssr: false })`. The page must be marked `"use client"` first.
+
+---
+
+## Sprint 10 — Detailed Record
+
+### Goal
+Production polish. Phase 2 validation, session resumability, export API, error handling UX.
+
+### Files created
+
+| Path | Purpose |
+|---|---|
+| `app/src/core/operations/phase2/op-2-10-validation.ts` | Op 2.10 — code-level checks + AI validation for Phase 2 completion |
+| `app/src/core/operations/phase2/__tests__/op-2-10-validation.test.ts` | 4 tests for code-level checks (no test run, failing tests, all pass, known issues) |
+| `app/src/core/session-manager/session-resume.ts` | Session resumability — scans for interrupted operations, marks as failed |
+| `app/src/core/session-manager/__tests__/session-resume.test.ts` | 4 tests for resume (empty, interrupted, completed, mixed) |
+| `app/src/app/api/export/route.ts` | POST /api/export — JSON bundle of session artifacts + wireframe files |
+| `app/src/components/DriftWarning.tsx` | DriftWarningBanner — FLAG (yellow) and DRIFT (red) banners with action buttons |
+| `app/src/components/ErrorBoundary.tsx` | React error boundary wrapping the AppShell |
+
+### Files modified
+
+| Path | Changes |
+|---|---|
+| `app/src/core/prompts/phase2-autogen-prompts.ts` | Added `phase2Validation` slug + `phase2ValidationPrompt()` + registration |
+| `app/src/core/operations/phase2/index.ts` | Re-exported `validatePhase2`, `runCodeChecks`, `runAIValidation` + types |
+| `app/src/core/session-manager/phase2-handlers.ts` | Replaced `completePhase` stub with real implementation — runs Op 2.10, transitions on PASS |
+| `app/src/core/session-manager/index.ts` | Re-exported `resumeInterruptedSessions` + types |
+| `app/src/core/bootstrap.ts` | Fire-and-forget `resumeInterruptedSessions()` on startup |
+| `app/src/stores/chat-store.ts` | Added `DriftWarning` type, `driftWarning` state, `showDriftWarning`/`dismissDriftWarning` actions |
+| `app/src/lib/use-sse.ts` | Added `drift` and `progress` SSE event handlers |
+| `app/src/components/ChatPanel.tsx` | Integrated DriftWarningBanner, added error dismiss button |
+| `app/src/components/AppShell.tsx` | Wrapped layout with ErrorBoundary |
+
+### Op 2.10 Phase 2 Validation — Two Steps
+
+**Step 1 — Code-level checks (no AI):**
+| Check | Failure message |
+|-------|-----------------|
+| Test run exists | "Please run the test suite at least once before completing this phase." |
+| Test run is recent (not stale) | "The wireframe has changed since tests were last run. Please run tests again." |
+| All tests pass or known issues | "N test(s) are still failing." |
+| HTML file for every screen | "Missing wireframe file for screen: X" |
+| Test defs for every workflow | "Missing test definitions for workflow: X" |
+
+**Step 2 — AI validation (only runs if Step 1 passes):**
+Uses `phase2ValidationPrompt` with full artifact context (contract, workflows, tests, screens, wireframe files, test results). Returns PASS/FAIL with issues/warnings/suggestions via `parseValidationResult`.
+
+### Session Resumability Design
+
+On bootstrap, `resumeInterruptedSessions()` runs as fire-and-forget:
+1. Lists all sessions from storage
+2. For each session, gets all operation progress records
+3. Finds any with `status: "in_progress"`
+4. Marks them as `status: "failed"` with error "interrupted by server restart"
+
+This is the safe approach — full DAG-resume-mid-flight is deferred because replaying partial chain state is error-prone. The user can retry by re-triggering the operation.
+
+### Testing Record — Sprint 10
+
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | ✅ 0 errors |
+| `npx vitest run` (new tests only) | ✅ 8/8 passed |
+| `npx vitest run` (full suite) | ✅ 219/221 (2 Ollama integration tests fail — pre-existing, Ollama not running) |
+
+### New test count: 8 (total: 227)

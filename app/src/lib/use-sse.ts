@@ -253,6 +253,44 @@ async function consumeSSEStream(
             break;
           }
 
+          case "drift": {
+            const drift = parsed.data as {
+              classification: "FLAG" | "DRIFT";
+              type: string;
+              reason: string;
+            };
+            chatStore().showDriftWarning(drift);
+            break;
+          }
+
+          case "progress": {
+            // Progress events are informational. Surface them as transient
+            // system messages so the user sees operation progress.
+            const progress = parsed.data as {
+              operationId: string;
+              status: string;
+              detail?: string;
+            };
+            if (progress.detail) {
+              chatStore().addMessage({
+                id: `progress-${progress.operationId}-${Date.now()}`,
+                sessionId: sessionStore().activeSessionId ?? "",
+                phaseId: "phase-2",
+                role: "system",
+                type: "system_notification",
+                content: `[${progress.operationId}] ${progress.detail}`,
+                metadata: {
+                  screenReference: null,
+                  generationContext: null,
+                  operationId: null,
+                  stale: false,
+                },
+                createdAt: new Date().toISOString(),
+              });
+            }
+            break;
+          }
+
           case "error": {
             const err = parsed.data as { error: string; fatal?: boolean };
             chatStore().setError(err.error);

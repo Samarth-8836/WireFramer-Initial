@@ -6,12 +6,14 @@ import { useChatStore } from "@stores/chat-store";
 import { useSessionStore } from "@stores/session-store";
 
 import { ChatInput } from "./ChatInput";
+import { DriftWarningBanner } from "./DriftWarning";
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
   const streamingText = useChatStore((s) => s.streamingText);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const error = useChatStore((s) => s.error);
+  const driftWarning = useChatStore((s) => s.driftWarning);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
 
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -56,15 +58,24 @@ export function ChatPanel() {
           </div>
         )}
 
-        {/* Error display */}
+        {/* Error display with retry */}
         {error && (
           <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-            {error}
+            <p>{error}</p>
+            <button
+              onClick={() => useChatStore.getState().setError(null)}
+              className="mt-2 rounded bg-red-100 px-3 py-1 text-xs font-medium text-red-800 hover:bg-red-200 dark:bg-red-900 dark:text-red-200 dark:hover:bg-red-800"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
         <div ref={bottomRef} />
       </div>
+
+      {/* Drift warning banner */}
+      {driftWarning && <DriftWarningBanner />}
 
       {/* Input */}
       <ChatInput />

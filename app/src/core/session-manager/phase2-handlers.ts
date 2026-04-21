@@ -9,6 +9,7 @@ import { WireframeManager } from "@core/wireframe/wireframe-manager";
 import {
   executeDriftCheck,
   executePhase2Conversational,
+  validatePhase2,
 } from "@core/operations/phase2";
 import {
   executeWorkflowDiscovery,
@@ -274,13 +275,112 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     sse.sendComplete({ event: "cascade_complete" });
   }
 
-  // Phase 2 completion — Sprint 10 (export + validation).
-  async completePhase(_sessionId: string, sse: SSEWriter): Promise<void> {
-    sse.sendError(
-      "Phase 2 completion is not yet implemented (Sprint 10).",
-      true,
-    );
-    sse.close();
+  // Phase 2 completion — runs Op 2.10 validation. On PASS, transitions
+  // phase-2 → completing → complete. On FAIL, stays active with issues.
+  async completePhase(sessionId: string, sse: SSEWriter): Promise<void> {
+    const { storage, executor, promptRegistry } = this.deps;
+
+    sse.sendProgress({
+      operationId: "op-2-10",
+      status: "in_progress",
+      detail: "Validating Phase 2 artifacts",
+    });
+
+    try {
+      const result = await validatePhase2(
+        executor,
+        promptRegistry,
+        storage,
+        this.wireframeManager,
+        sessionId,
+      );
+
+      // Persist validation result as a system message.
+      const validationMessage = this.formatPhase2ValidationMessage(result);
+      await storage.addMessage({
+        id: uuidv4(),
+        sessionId,
+        phaseId: "phase-2",
+        role: "system",
+        type: "validation_result",
+        content: validationMessage,
+        metadata: {
+          screenReference: null,
+          generationContext: null,
+          operationId: "op-2-10",
+          stale: false,
+        },
+        createdAt: new Date().toISOString(),
+      });
+
+      if (result.overall === "PASS") {
+        await transitionPhase(storage, sessionId, "phase-2", "completing");
+        await transitionPhase(storage, sessionId, "phase-2", "complete");
+
+        sse.send({
+          type: "phase",
+          data: { from: "phase-2", to: "phase-2", status: "complete" },
+        });
+      } else {
+        sse.send({
+          type: "phase",
+          data: { from: "phase-2", to: "phase-2", status: "active" },
+        });
+      }
+
+      // Surface the detailed results.
+      const issues = [
+        ...result.codeChecks.failures,
+        ...(result.aiValidation?.issues ?? []),
+      ];
+      const suggestions = result.aiValidation?.suggestions ?? [];
+
+      sse.send({
+        type: "test_results",
+        data: {
+          status: result.overall,
+          issues,
+          suggestions,
+          warnings: result.aiValidation?.warnings ?? [],
+        },
+      });
+
+      sse.sendComplete({ validation: result.overall });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      sse.sendError(`Phase 2 validation failed: ${message}`, true);
+      sse.close();
+    }
+  }
+
+  private formatPhase2ValidationMessage(result: {
+    codeChecks: { passed: boolean; failures: string[] };
+    aiValidation: { status: string; issues: string[]; warnings: string[]; suggestions: string[] } | null;
+    overall: string;
+  }): string {
+    const lines: string[] = [`STATUS: ${result.overall}`];
+
+    if (result.codeChecks.failures.length > 0) {
+      lines.push("", "Code check failures:");
+      for (const f of result.codeChecks.failures) lines.push(`- ${f}`);
+    }
+
+    if (result.aiValidation) {
+      if (result.aiValidation.issues.length > 0) {
+        lines.push("", "AI validation issues:");
+        for (const issue of result.aiValidation.issues) lines.push(`- ${issue}`);
+      }
+      if (result.aiValidation.warnings.length > 0) {
+        lines.push("", "Warnings:");
+        for (const w of result.aiValidation.warnings) lines.push(`- ${w}`);
+      }
+      if (result.aiValidation.suggestions.length > 0) {
+        lines.push("", "Suggestions:");
+        for (const s of result.aiValidation.suggestions) lines.push(`- ${s}`);
+      }
+    }
+
+    return lines.join("\n");
   }
 
   // ── Build all 20 DAG runners ─────────────────────────────────

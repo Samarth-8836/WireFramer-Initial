@@ -39,3 +39,8 @@ export {
 } from "./rollback";
 export { routeCascade, type CascadeScope, type CascadeRoute } from "./cascade-router";
 export { CascadeExecutor } from "./cascade-executor";
+export {
+  resumeInterruptedSessions,
+  type ResumeReport,
+  type InterruptedOperation,
+} from "./session-resume";

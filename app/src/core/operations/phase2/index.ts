@@ -60,3 +60,11 @@ export {
   type DiagnosisInput,
   type DiagnosisOutput,
 } from "./op-2-9-diagnosis";
+
+export {
+  validatePhase2,
+  runCodeChecks,
+  runAIValidation,
+  type Phase2ValidationResult,
+  type CodeCheckResult,
+} from "./op-2-10-validation";

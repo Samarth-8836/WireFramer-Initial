@@ -11,6 +11,7 @@ import {
   Phase1HandlersImpl,
   Phase2HandlersImpl,
   SessionManager,
+  resumeInterruptedSessions,
 } from "@core/session-manager";
 import { FileStorage } from "@core/storage";
 import type { IStorage } from "@core/storage";
@@ -98,6 +99,17 @@ export function getBootstrap(options: BootstrapOptions = {}): Bootstrapped {
     contextBuilder,
     sessionManager,
   };
+
+  // Fire-and-forget: scan for interrupted operations on startup.
+  void resumeInterruptedSessions(storage).then((report) => {
+    if (report.interruptedOperations.length > 0) {
+      console.warn(
+        `[bootstrap] Marked ${report.interruptedOperations.length} interrupted operation(s) as failed after restart.`,
+      );
+    }
+  }).catch((err) => {
+    console.warn("[bootstrap] Failed to scan for interrupted sessions:", err);
+  });
 
   return cached;
 }

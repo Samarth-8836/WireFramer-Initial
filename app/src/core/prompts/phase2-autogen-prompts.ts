@@ -27,6 +27,8 @@ export const PHASE2_PROMPT_SLUGS = {
   targetedScreenUpdate: "targeted-screen-update",
   targetedWorkflowUpdate: "targeted-workflow-update",
   diagnosis: "test-failure-diagnosis",
+  // Phase 2 completion validation (Sprint 10)
+  phase2Validation: "phase2-validation",
 } as const;
 
 // Spec §17.5 — Operation 2.1a Workflow Discovery
@@ -606,6 +608,43 @@ proposed_fix: [specific description of what needs to change]
 confidence: [high or medium or low]`;
 }
 
+// Spec §17.22 — Op 2.10 Phase 2 Validation
+export function phase2ValidationPrompt(): string {
+  return `You are a product completeness validator for Phase 2 (artifact generation). Your job is to check whether the generated artifacts are complete, consistent, and ready for handoff.
+
+You will receive:
+1. The locked Project Contract (personas, entities, boundaries)
+2. The Workflow Map (all workflows with steps)
+3. The Test Suite (test cases per workflow)
+4. The Screen Inventory (all screens with navigation)
+5. A list of wireframe files that exist
+6. The latest test run results (if any)
+
+Check for:
+- Every workflow in the Workflow Map has at least one test case in the Test Suite
+- Every screen referenced in workflows exists in the Screen Inventory
+- Every screen in the Screen Inventory has a corresponding wireframe HTML file
+- Navigation paths in the Screen Inventory form a connected graph (no orphan screens)
+- All personas from the Project Contract are represented in at least one workflow
+- All entities from the Project Contract appear in at least one screen
+- Test coverage: every workflow has test cases that cover the happy path at minimum
+
+Respond in this exact format:
+
+STATUS: PASS (or FAIL)
+
+ISSUES:
+- [list each problem found, one per line]
+
+WARNINGS:
+- [list non-blocking concerns, one per line]
+
+SUGGESTIONS:
+- [list improvement ideas, one per line]
+
+If there are no items for a section, write "None" on the next line.`;
+}
+
 // Seed a PromptRegistry with all Phase 2 prompts.
 export function registerPhase2Prompts(registry: IPromptRegistry): void {
   registry.register(PHASE2_PROMPT_SLUGS.workflowDiscovery, workflowDiscoveryPrompt());
@@ -630,4 +669,6 @@ export function registerPhase2Prompts(registry: IPromptRegistry): void {
   registry.register(PHASE2_PROMPT_SLUGS.targetedScreenUpdate, targetedScreenUpdatePrompt());
   registry.register(PHASE2_PROMPT_SLUGS.targetedWorkflowUpdate, targetedWorkflowUpdatePrompt());
   registry.register(PHASE2_PROMPT_SLUGS.diagnosis, diagnosisPrompt());
+  // Phase 2 completion validation (Sprint 10)
+  registry.register(PHASE2_PROMPT_SLUGS.phase2Validation, phase2ValidationPrompt());
 }

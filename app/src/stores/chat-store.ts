@@ -4,12 +4,19 @@ import { create } from "zustand";
 
 import type { ChatMessage } from "@core/types";
 
+export interface DriftWarning {
+  classification: "FLAG" | "DRIFT";
+  type: string;
+  reason: string;
+}
+
 interface ChatStore {
   messages: ChatMessage[];
   streamingText: string;
   isStreaming: boolean;
   isBlocked: boolean;
   error: string | null;
+  driftWarning: DriftWarning | null;
 
   loadMessages: (messages: ChatMessage[]) => void;
   addMessage: (message: ChatMessage) => void;
@@ -19,6 +26,8 @@ interface ChatStore {
   cancelStream: () => void;
   setBlocked: (blocked: boolean) => void;
   setError: (error: string | null) => void;
+  showDriftWarning: (warning: DriftWarning) => void;
+  dismissDriftWarning: () => void;
   clear: () => void;
 }
 
@@ -28,6 +37,7 @@ export const useChatStore = create<ChatStore>((set) => ({
   isStreaming: false,
   isBlocked: false,
   error: null,
+  driftWarning: null,
 
   loadMessages: (messages: ChatMessage[]) => {
     set({ messages, streamingText: "", isStreaming: false });
@@ -66,6 +76,14 @@ export const useChatStore = create<ChatStore>((set) => ({
     set({ error, isBlocked: false, isStreaming: false });
   },
 
+  showDriftWarning: (warning: DriftWarning) => {
+    set({ driftWarning: warning, isBlocked: true, isStreaming: false });
+  },
+
+  dismissDriftWarning: () => {
+    set({ driftWarning: null, isBlocked: false });
+  },
+
   clear: () => {
     set({
       messages: [],
@@ -73,6 +91,7 @@ export const useChatStore = create<ChatStore>((set) => ({
       isStreaming: false,
       isBlocked: false,
       error: null,
+      driftWarning: null,
     });
   },
 }));
