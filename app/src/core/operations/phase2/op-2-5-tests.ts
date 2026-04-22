@@ -123,6 +123,15 @@ export async function executeTestTranslationBatch(
     );
   }
 
+  // No translated tests → tests.js would be empty → dry run finds
+  // nothing to run → stage would "succeed" with zero coverage. Fail.
+  if (results.succeeded.length === 0 && results.failed.length > 0) {
+    const firstError = results.failed[0]?.error ?? "unknown error";
+    throw new Error(
+      `op-2-5b failed on all ${results.failed.length} test block(s). First error: ${firstError}`,
+    );
+  }
+
   return {
     translatedTests: results.succeeded.map((s) => s.result as string),
   };

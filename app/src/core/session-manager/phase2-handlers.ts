@@ -113,6 +113,14 @@ export class Phase2HandlersImpl implements Phase2Handlers {
       await this.initializePhase2(sessionId, sse);
       await this.runDesignStage(sessionId, sse);
     } catch (err) {
+      // Revert phase2Stage to "not_started" so the UI doesn't show a
+      // misleading "design running" spinner after the stream closes.
+      // A retry requires hitting /api/phase2/start again.
+      try {
+        await setPhase2Stage(this.deps.storage, sessionId, "not_started");
+      } catch {
+        /* storage error during revert — best-effort, already in a failure path */
+      }
       const msg = err instanceof Error ? err.message : String(err);
       sse.sendError(`Phase 2 design stage failed: ${msg}`, true);
       sse.close();
@@ -122,25 +130,32 @@ export class Phase2HandlersImpl implements Phase2Handlers {
   // Called by /api/phase2/advance when the user clicks "Approve" on the
   // current stage's review. Dispatches to the next stage runner based
   // on the session's current phase2Stage.
+  //
+  // On any failure during the next stage, we revert phase2Stage to the
+  // review state the user started from — so the UI comes back to the
+  // same state they clicked Approve on (can read the same docs, try
+  // again, or drop the session). Without this revert, a failed advance
+  // leaves the session stuck in a `_running` state with no recovery
+  // path short of manual storage edits.
   async advanceStage(sessionId: string, sse: SSEWriter): Promise<void> {
     const { storage } = this.deps;
 
+    const session = await storage.getSession(sessionId);
+    if (!session) {
+      sse.sendError(`Session ${sessionId} not found.`, true);
+      sse.close();
+      return;
+    }
+
+    const originalStage = session.phase2Stage ?? "not_started";
+    const { ok, next, reason } = canAdvanceStage(originalStage);
+    if (!ok || !next) {
+      sse.sendError(reason ?? "Cannot advance stage.", true);
+      sse.close();
+      return;
+    }
+
     try {
-      const session = await storage.getSession(sessionId);
-      if (!session) {
-        sse.sendError(`Session ${sessionId} not found.`, true);
-        sse.close();
-        return;
-      }
-
-      const current = session.phase2Stage ?? "not_started";
-      const { ok, next, reason } = canAdvanceStage(current);
-      if (!ok || !next) {
-        sse.sendError(reason ?? "Cannot advance stage.", true);
-        sse.close();
-        return;
-      }
-
       switch (next) {
         case "wireframe_running":
           await this.runWireframeStage(sessionId, sse);
@@ -160,6 +175,11 @@ export class Phase2HandlersImpl implements Phase2Handlers {
           return;
       }
     } catch (err) {
+      try {
+        await setPhase2Stage(storage, sessionId, originalStage);
+      } catch {
+        /* storage error during revert — already in a failure path */
+      }
       const msg = err instanceof Error ? err.message : String(err);
       sse.sendError(`Stage advance failed: ${msg}`, true);
       sse.close();
@@ -540,6 +560,15 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     });
 
     await dag.execute(nodes);
+    assertDagSucceeded(dag, "Design");
+
+    // Belt-and-suspenders: confirm both stage-1 documents actually exist
+    // before we tell the UI "design is ready for review". Catches the
+    // case where an op "succeeds" but the document write was lost.
+    await assertDocumentsExist(storage, sessionId, [
+      "workflow_map",
+      "screen_inventory",
+    ]);
 
     await setPhase2Stage(
       storage,
@@ -564,10 +593,14 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     const { storage, executor, promptRegistry } = this.deps;
     const wm = this.wireframeManager;
 
+    // Validate prior-stage outputs BEFORE transitioning state. If this
+    // throws, the session stays in design_review so the user can retry
+    // (or drop the session and start over).
+    const prior = await readDesignStageOutputs(storage, sessionId);
+
     await setPhase2Stage(storage, sessionId, "wireframe_running");
     sse.sendStage({ stageName: "wireframe", status: "running" });
 
-    const prior = await readDesignStageOutputs(storage, sessionId);
     const state: WireframeStageState = {
       workflowMapStructuredData: prior.workflowMapStructuredData,
       finalScreenInventoryYaml: prior.screenInventoryYaml,
@@ -655,6 +688,11 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     });
 
     await dag.execute(nodes);
+    assertDagSucceeded(dag, "Wireframe");
+    // We don't persist wireframe outputs as Documents (they're on-disk
+    // under /data/sessions/<id>/wireframe/), so there's no document
+    // existence check here — the per-op writeFile calls are the
+    // authoritative write.
 
     await setPhase2Stage(
       storage,
@@ -678,10 +716,12 @@ export class Phase2HandlersImpl implements Phase2Handlers {
   ): Promise<void> {
     const { storage, executor, promptRegistry } = this.deps;
 
+    // Validate inputs BEFORE transitioning state.
+    const prior = await readDesignStageOutputs(storage, sessionId);
+
     await setPhase2Stage(storage, sessionId, "test_suite_running");
     sse.sendStage({ stageName: "test_suite", status: "running" });
 
-    const prior = await readDesignStageOutputs(storage, sessionId);
     const state: TestSuiteStageState = {
       detailedWorkflows: prior.detailedWorkflows,
       workflowMapStructuredData: prior.workflowMapStructuredData,
@@ -760,6 +800,8 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     });
 
     await dag.execute(nodes);
+    assertDagSucceeded(dag, "Test Suite");
+    await assertDocumentsExist(storage, sessionId, ["test_suite"]);
 
     await setPhase2Stage(
       storage,
@@ -784,11 +826,13 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     const { storage, executor, promptRegistry } = this.deps;
     const wm = this.wireframeManager;
 
+    // Validate both prior stages' outputs BEFORE transitioning state.
+    const designOut = await readDesignStageOutputs(storage, sessionId);
+    const testSuiteOut = await readTestSuiteStageOutputs(storage, sessionId);
+
     await setPhase2Stage(storage, sessionId, "automated_tests_running");
     sse.sendStage({ stageName: "automated_tests", status: "running" });
 
-    const designOut = await readDesignStageOutputs(storage, sessionId);
-    const testSuiteOut = await readTestSuiteStageOutputs(storage, sessionId);
     const state: AutomatedTestsStageState = {
       screenIds: designOut.screenIds,
       finalScreenInventoryYaml: designOut.screenInventoryYaml,
@@ -860,6 +904,7 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     });
 
     await dag.execute(nodes);
+    assertDagSucceeded(dag, "Automated Tests");
 
     await setPhase2Stage(
       storage,
@@ -942,6 +987,81 @@ export class Phase2HandlersImpl implements Phase2Handlers {
 }
 
 // ── Stage output recovery (free functions) ────────────────────
+
+// Inspects a completed DAG's status map + error map. Throws a single
+// consolidated error if any nodes failed or were left unreachable.
+//
+// Why this exists: DependencyGraphExecutor.runNode swallows per-node
+// exceptions (intentionally — it wants siblings to keep progressing
+// when one branch fails). But for our Phase-2 stages, any op failing
+// means the stage output is incomplete; we need to surface that to the
+// caller rather than cheerfully transitioning to `_review`.
+function assertDagSucceeded(
+  dag: DependencyGraphExecutor,
+  stageName: string,
+): void {
+  const statuses = dag.getStatuses();
+  const failed: string[] = [];
+  const skipped: string[] = [];
+  for (const [opId, status] of statuses) {
+    if (status === "failed") failed.push(opId);
+    // Skipped nodes are normal for conditional ops (op-2-3c, op-2-5e).
+    // The DAG already filters those through `condition`. Any skip that
+    // reaches the end-of-run unreachable sweep means an upstream failed
+    // and blocked the dep chain — we don't need to double-report those,
+    // but they signal the same root cause.
+    else if (status === "skipped" && !KNOWN_CONDITIONAL_OPS.has(opId)) {
+      skipped.push(opId);
+    }
+  }
+
+  if (failed.length === 0 && skipped.length === 0) return;
+
+  const errors = dag.getErrors();
+  const firstFailed = failed[0];
+  const firstError =
+    firstFailed !== undefined ? errors.get(firstFailed) : undefined;
+
+  const details: string[] = [];
+  if (failed.length > 0) {
+    details.push(`failed ops: ${failed.join(", ")}`);
+  }
+  if (skipped.length > 0) {
+    details.push(`unreachable ops (upstream failure): ${skipped.join(", ")}`);
+  }
+
+  const rootCause = firstError
+    ? ` — first failure in ${firstFailed}: ${firstError.message}`
+    : "";
+
+  throw new Error(
+    `${stageName} stage incomplete (${details.join("; ")})${rootCause}`,
+  );
+}
+
+const KNOWN_CONDITIONAL_OPS = new Set(["op-2-3c", "op-2-5e"]);
+
+// Verify the expected output documents for a stage are actually in
+// storage. Catches the edge case where an op's LLM call "succeeded"
+// (parser happy) but the document write failed or produced garbage.
+async function assertDocumentsExist(
+  storage: IStorage,
+  sessionId: string,
+  types: Array<"project_contract" | "workflow_map" | "test_suite" | "screen_inventory">,
+): Promise<void> {
+  const missing: string[] = [];
+  for (const type of types) {
+    const doc = await storage.getActiveDocument(sessionId, type);
+    if (!doc || !doc.content.trim()) {
+      missing.push(type);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Stage outputs missing — expected documents were not persisted: ${missing.join(", ")}`,
+    );
+  }
+}
 
 async function readDesignStageOutputs(
   storage: IStorage,

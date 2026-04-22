@@ -56,6 +56,16 @@ export async function executeTestCaseGenerationBatch(
     );
   }
 
+  // If every workflow's test cases failed, downstream coverage + format
+  // ops would operate on an empty array and emit a useless (or broken)
+  // Test Suite doc. Fail the whole stage instead.
+  if (results.succeeded.length === 0 && results.failed.length > 0) {
+    const firstError = results.failed[0]?.error ?? "unknown error";
+    throw new Error(
+      `op-2-2a failed on all ${results.failed.length} workflow(s). First error: ${firstError}`,
+    );
+  }
+
   return {
     testCaseBlocks: results.succeeded.map((s) => s.result as string),
   };

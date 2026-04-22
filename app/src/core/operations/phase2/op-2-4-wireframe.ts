@@ -180,6 +180,16 @@ export async function executeScreenHtmlBatch(
     );
   }
 
+  // If every screen failed, the wireframe iframe would render nothing
+  // useful. Fail the stage so the user knows to retry instead of
+  // clicking into empty tabs.
+  if (results.succeeded.length === 0 && results.failed.length > 0) {
+    const firstError = results.failed[0]?.error ?? "unknown error";
+    throw new Error(
+      `op-2-4c failed on all ${results.failed.length} screen(s). First error: ${firstError}`,
+    );
+  }
+
   return { screenHtmlMap };
 }
 

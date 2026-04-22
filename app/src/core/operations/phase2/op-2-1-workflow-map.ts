@@ -92,6 +92,17 @@ export async function executeWorkflowDetailBatch(
     );
   }
 
+  // If every item failed we have no data to pass downstream. Continuing
+  // would give op-2-1c an empty string, which either produces an empty
+  // document or fails in an obscure way. Fail loudly so the stage
+  // runner marks the whole stage failed instead of silently moving on.
+  if (results.succeeded.length === 0 && results.failed.length > 0) {
+    const firstError = results.failed[0]?.error ?? "unknown error";
+    throw new Error(
+      `op-2-1b failed on all ${results.failed.length} workflow(s). First error: ${firstError}`,
+    );
+  }
+
   const detailedWorkflows = results.succeeded.map(
     (s) => s.result as string,
   );
