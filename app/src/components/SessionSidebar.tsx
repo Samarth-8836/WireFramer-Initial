@@ -27,8 +27,17 @@ export function SessionSidebar() {
       const phase1Messages = data.messages?.["phase-1"] ?? [];
       const phase2Messages = data.messages?.["phase-2"] ?? [];
       const currentPhase = data.session?.currentPhaseId ?? "phase-1";
+
+      // Phase 1 sessions just show phase-1 messages. Phase 2 sessions
+      // show everything — phase-1 history + a visual divider + phase-2
+      // messages — so users who switch away during auto-gen can come
+      // back and still see the Phase 1 conversation context.
       const messages =
-        currentPhase === "phase-1" ? phase1Messages : phase2Messages;
+        currentPhase === "phase-1"
+          ? phase1Messages
+          : phase2Messages.length === 0 && phase1Messages.length > 0
+            ? [...phase1Messages, buildPhaseDivider(id)]
+            : [...phase1Messages, buildPhaseDivider(id), ...phase2Messages];
       useChatStore.getState().loadMessages(messages);
 
       if (data.documents?.length) {
@@ -82,6 +91,29 @@ export function SessionSidebar() {
       </nav>
     </aside>
   );
+}
+
+// Synthetic system message used as a visual break between Phase 1 and
+// Phase 2 history in a rehydrated session. Not persisted — purely a UI
+// affordance.
+function buildPhaseDivider(
+  sessionId: string,
+): import("@core/types").ChatMessage {
+  return {
+    id: `phase-divider-${sessionId}`,
+    sessionId,
+    phaseId: "phase-2",
+    role: "system",
+    type: "system_notification",
+    content: "— Phase 1 complete · Phase 2 in progress —",
+    metadata: {
+      screenReference: null,
+      generationContext: null,
+      operationId: null,
+      stale: false,
+    },
+    createdAt: new Date().toISOString(),
+  };
 }
 
 function formatRelativeTime(iso: string): string {

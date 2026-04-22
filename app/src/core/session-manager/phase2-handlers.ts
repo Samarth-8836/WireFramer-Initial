@@ -112,7 +112,7 @@ export class Phase2HandlersImpl implements Phase2Handlers {
 
     sse.send({
       type: "phase",
-      data: { from: "phase-1", to: "phase-2", status: "active" },
+      data: { phaseId: "phase-2", status: "active" },
     });
 
     const state: ChainState = {
@@ -337,12 +337,12 @@ export class Phase2HandlersImpl implements Phase2Handlers {
 
         sse.send({
           type: "phase",
-          data: { from: "phase-2", to: "phase-2", status: "complete" },
+          data: { phaseId: "phase-2", status: "complete" },
         });
       } else {
         sse.send({
           type: "phase",
-          data: { from: "phase-2", to: "phase-2", status: "active" },
+          data: { phaseId: "phase-2", status: "active" },
         });
       }
 

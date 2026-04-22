@@ -216,15 +216,37 @@ async function consumeSSEStream(
           }
 
           case "phase": {
+            // Server emits `{phaseId, status, detail?}`. Construct a
+            // minimal PhaseState so the phase indicator reflects the new
+            // status immediately (previously the client only checked
+            // `phaseId` but some emitters sent `from/to` and the event
+            // was dropped, leaving the indicator stuck on Phase 1).
             const phase = parsed.data as {
               phaseId?: string;
-              status?: string;
+              status?: import("@core/types").PhaseStatus;
+              detail?: string;
             };
-            if (phase.phaseId) {
-              sessionStore().updatePhaseState(
-                phase.phaseId,
-                parsed.data as import("@core/types").PhaseState,
-              );
+            if (phase.phaseId && phase.status) {
+              const now = new Date().toISOString();
+              const existing =
+                sessionStore().phaseStates[phase.phaseId] ?? null;
+              sessionStore().updatePhaseState(phase.phaseId, {
+                sessionId: sessionStore().activeSessionId ?? "",
+                phaseId: phase.phaseId as import("@core/types").PhaseId,
+                status: phase.status,
+                enteredAt:
+                  phase.status === "active" || phase.status === "completing"
+                    ? (existing?.enteredAt ?? now)
+                    : (existing?.enteredAt ?? null),
+                completedAt:
+                  phase.status === "complete"
+                    ? now
+                    : (existing?.completedAt ?? null),
+                suspendedAt:
+                  phase.status === "suspended"
+                    ? now
+                    : (existing?.suspendedAt ?? null),
+              });
             }
             break;
           }

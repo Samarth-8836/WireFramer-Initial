@@ -3,6 +3,9 @@ import type { IPromptRegistry } from "./prompt-registry";
 // Prompt bodies for every Phase 2 auto-generation operation.
 // Copied verbatim from spec §17.5-§17.21. Changing any of these
 // changes the product's behavior — treat them like config, not code.
+//
+// See ./README.md for the full catalog — which op uses which prompt,
+// expected input/output, and the parser each one pairs with.
 
 export const PHASE2_PROMPT_SLUGS = {
   workflowDiscovery: "workflow-discovery",
@@ -31,7 +34,17 @@ export const PHASE2_PROMPT_SLUGS = {
   phase2Validation: "phase2-validation",
 } as const;
 
-// Spec §17.5 — Operation 2.1a Workflow Discovery
+/**
+ * Op 2.1a — Workflow Discovery. Slug: `workflow-discovery`.
+ *
+ * Reads the Project Contract and emits a YAML list of every workflow
+ * (one per persona action + system-initiated flows). Parser: `parseYAML`.
+ *
+ * **Watch-out:** for non-trivial contracts this can easily generate 20+
+ * workflows, which causes Op 2.1b to run 20+ batched LLM calls and turns
+ * auto-gen into a 5-10 minute ordeal. Consider capping at ~15 core
+ * workflows in the prompt body if this becomes a pain point. Spec §17.5.
+ */
 export function workflowDiscoveryPrompt(): string {
   return `You are a product workflow analyst. Given a Project Contract, identify every distinct workflow that exists in the product.
 
@@ -58,7 +71,13 @@ workflows:
     category: [one of: core, supporting, edge-case, system]`;
 }
 
-// Spec §17.6 — Operation 2.1b Workflow Detail Generation
+/**
+ * Op 2.1b — Workflow Detail. Slug: `workflow-detail`.
+ *
+ * For each workflow stub from 2.1a, produces the full definition
+ * (pre-conditions, steps, exit criteria, edge cases). Runs in batch
+ * with semaphore=3 concurrency. Parser: `parseYAML`. Spec §17.6.
+ */
 export function workflowDetailPrompt(): string {
   return `You are a product workflow designer. You will be given a product description and a specific workflow to detail.
 
@@ -105,7 +124,12 @@ Be thorough with edge cases. Consider:
 - Rate limits or resource constraints`;
 }
 
-// Spec §17.7 — Operation 2.1c Workflow Map Formatting
+/**
+ * Op 2.1c — Workflow Map Formatting. Slug: `workflow-map-formatting`.
+ *
+ * Renders the Workflow Map markdown document from all detailed workflows.
+ * Parser: `parsePlainText`. Spec §17.7.
+ */
 export function workflowMapFormattingPrompt(): string {
   return `You are a document formatter. Convert the structured workflow data below into a clean, readable markdown document.
 
@@ -139,7 +163,13 @@ Outcome: [resolution]
 Repeat for each workflow, grouped by persona. System workflows go in their own section at the end.`;
 }
 
-// Spec §17.8 — Operation 2.2a Test Case Generation
+/**
+ * Op 2.2a — Test Case Generation. Slug: `test-case-generation`.
+ *
+ * For each detailed workflow, produces test cases covering happy path,
+ * edge cases, and error paths. Runs in batch. Parser: `parsePlainText`.
+ * Spec §17.8.
+ */
 export function testCaseGenerationPrompt(): string {
   return `You are a test case writer. Given a product description and a single workflow definition, produce test cases that fully cover the workflow.
 
@@ -169,7 +199,12 @@ Rules:
 - For non-UI steps (background jobs, emails, webhooks), assertions check system state, not screen content.`;
 }
 
-// Spec §17.9 — Operation 2.2b Entity Coverage Check
+/**
+ * Op 2.2b — Entity Coverage Check. Slug: `entity-coverage-check`.
+ *
+ * Ensures every entity in the Project Contract is exercised by at least
+ * one test case. Emits any coverage gaps. Parser: `parseYAML`. Spec §17.9.
+ */
 export function entityCoverageCheckPrompt(): string {
   return `You are a coverage analyst. Compare the entity list from the Project Contract against the workflows in the Workflow Map.
 
@@ -188,7 +223,12 @@ unused_entities:
   - [entity name]: [suggestion — should this entity be removed from the contract, or is a workflow missing?]`;
 }
 
-// Spec §17.10 — Operation 2.2c Test Suite Formatting
+/**
+ * Op 2.2c — Test Suite Formatting. Slug: `test-suite-formatting`.
+ *
+ * Renders the Test Suite markdown document from the test case blocks +
+ * coverage analysis. Parser: `parsePlainText`. Spec §17.10.
+ */
 export function testSuiteFormattingPrompt(): string {
   return `You are a document formatter. Convert the structured test case data below into a clean, readable markdown document.
 
@@ -227,7 +267,12 @@ Group tests by persona, then by workflow. System workflow tests at the end.
 If there are unused entities, add a section: "## Entity Coverage Flags" listing them with suggestions.`;
 }
 
-// Spec §17.12 — Operation 2.3a Screen Extraction
+/**
+ * Op 2.3a — Screen Extraction. Slug: `screen-extraction`.
+ *
+ * From the Workflow Map, extracts every screen the UI needs (id, purpose,
+ * key data shown, outgoing navigation). Parser: `parseYAML`. Spec §17.12.
+ */
 export function screenExtractionPrompt(): string {
   return `You are a UX analyst. Given a set of workflows, extract every distinct screen that the application needs.
 
@@ -254,7 +299,14 @@ screens:
     entry_point: [true or false]`;
 }
 
-// Spec §17.13 — Operation 2.3b Navigation Validation
+/**
+ * Op 2.3b — Screen Navigation Validation. Slug: `screen-navigation-validation`.
+ *
+ * Checks that the screen inventory's navigation graph is connected — every
+ * workflow can reach the screens it needs. Returns PASS or an `issues` list.
+ * The conditional Op 2.3c only runs if this emits issues. Parser: `parseYAML`.
+ * Spec §17.13.
+ */
 export function screenNavValidationPrompt(): string {
   return `You are a UX consistency checker. Given a set of screens with their actions and navigation links, check for:
 
@@ -279,14 +331,24 @@ fixes:
     suggested_fix: [what to add or change]`;
 }
 
-// Spec §17.14 — Operation 2.3c Screen Correction (conditional)
+/**
+ * Op 2.3c — Screen Inventory Correction (conditional). Slug: `screen-inventory-correction`.
+ *
+ * Only runs when 2.3b reported issues. Applies navigation fixes to the
+ * screen inventory. Parser: `parsePlainText`. Spec §17.14.
+ */
 export function screenCorrectionPrompt(): string {
   return `You are a UX analyst. You previously generated a screen inventory that had some issues. Apply the fixes below and produce the corrected screen inventory in the same YAML format.
 
 Only change what the fixes require. Do not alter screens that have no issues.`;
 }
 
-// Spec §17.15 — Operation 2.3d Screen Inventory Formatting
+/**
+ * Op 2.3d — Screen Inventory Formatting. Slug: `screen-inventory-formatting`.
+ *
+ * Renders the Screen Inventory markdown document. Parser: `parsePlainText`.
+ * Spec §17.15.
+ */
 export function screenInventoryFormattingPrompt(): string {
   return `You are a document formatter. Convert the structured screen inventory data below into a clean, readable markdown document.
 
@@ -320,7 +382,13 @@ Format:
 Repeat for each screen. Group UI screens first, System Info screens at the end in their own section.`;
 }
 
-// Spec §17.16 — Operation 2.4a Dummy Data Generation
+/**
+ * Op 2.4a — Dummy Data Generation. Slug: `dummy-data-generation`.
+ *
+ * Produces realistic placeholder data (JSON) for every entity in the
+ * Project Contract, so wireframes can render content instead of
+ * lorem-ipsum. Parser: `parseJSON`. Spec §17.16.
+ */
 export function dummyDataGenerationPrompt(): string {
   return `You are a test data generator. Given a product's entity map and workflows, produce a set of realistic dummy data that can be used to populate a wireframe prototype.
 
@@ -342,7 +410,12 @@ Format as JSON:
 }`;
 }
 
-// Spec §17.17 — Operation 2.4b Wireframe Shell
+/**
+ * Op 2.4b — Wireframe Shell. Slug: `wireframe-shell`.
+ *
+ * Generates the top-level `index.html` that holds navigation and
+ * screen-switching logic. Parser: `parsePlainText` (raw HTML). Spec §17.17.
+ */
 export function wireframeShellPrompt(): string {
   return `You are a wireframe developer. Generate an index.html file that serves as the shell for a clickable wireframe prototype.
 
@@ -369,7 +442,13 @@ The entry point screen is: [entry point screen ID]
 No external dependencies. Plain HTML, CSS, JavaScript only.`;
 }
 
-// Spec §17.18 — Operation 2.4c Screen HTML Generation
+/**
+ * Op 2.4c — Screen HTML Generation. Slug: `screen-html-generation`.
+ *
+ * For each screen in the inventory, generates the HTML that renders it
+ * from the dummy data. Batch op. Parser: `parsePlainText` (raw HTML).
+ * Spec §17.18.
+ */
 export function screenHtmlGenerationPrompt(): string {
   return `You are a wireframe developer. Generate a single HTML file for one screen of a clickable wireframe prototype.
 
@@ -388,7 +467,13 @@ Requirements:
 - For EACH action available on this screen, there MUST be a visible interactive element (button, link, or clickable area).`;
 }
 
-// Spec §17.19 — Operation 2.5a Test Harness
+/**
+ * Op 2.5a — Test Harness. Slug: `test-harness`.
+ *
+ * Generates `test-harness.html` that loads wireframe screens in an iframe
+ * and exposes hooks for the translated test definitions to drive.
+ * Parser: `parsePlainText` (raw HTML). Spec §17.19.
+ */
 export function testHarnessPrompt(): string {
   return `You are a test automation developer. Generate a test harness HTML file that can execute automated tests against a wireframe prototype.
 
@@ -424,7 +509,13 @@ The test harness must:
 No external dependencies. Plain HTML, CSS, JavaScript.`;
 }
 
-// Spec §17.20 — Operation 2.5b Test Translation
+/**
+ * Op 2.5b — Test Translation. Slug: `test-translation`.
+ *
+ * For each test case, produces an executable test definition (click
+ * selectors, expected values) that the harness can run against the
+ * wireframe. Batch op. Parser: `parsePlainText`. Spec §17.20.
+ */
 export function testTranslationPrompt(): string {
   return `You are a test automation developer. Convert human-readable test cases into executable test definitions that the test harness can run.
 
@@ -459,7 +550,12 @@ tests:
         [step params]`;
 }
 
-// Spec §17.21 — Operation 2.5e Test Repair (conditional)
+/**
+ * Op 2.5e — Test Repair (conditional). Slug: `test-repair`.
+ *
+ * Only runs when the code-only dry run (Op 2.5d) detected broken test
+ * selectors. Applies minimal fixes. Parser: `parsePlainText`. Spec §17.21.
+ */
 export function testRepairPrompt(): string {
   return `You are a test automation developer fixing a broken test. The test was generated but failed during execution.
 
@@ -478,7 +574,15 @@ Produce the COMPLETE fixed test definition (all steps, not just the fixed one).`
 
 // ── Phase 2 Interaction Prompts (Sprint 7) ─────────────────────
 
-// Spec §17.26 — Op 2.7a Phase 2 Conversational AI
+/**
+ * Op 2.7a — Phase 2 Conversational AI. Slug: `phase2-conversational`.
+ *
+ * Phase 2 chat handler. Same shape as Phase 1 conversational but emits
+ * `<change_context>` instead of `<generation_context>`. The change_context
+ * has `scope` (data_only / screen_only / workflow_change) and
+ * `description` fields that drive the CascadeRouter. Parser:
+ * `extractChangeContext`. Spec §17.26.
+ */
 export function phase2ConversationalPrompt(): string {
   return `You are a product prototype advisor helping a user refine their wireframe prototype. You are in Phase 2: Workflow and UX Definition.
 
@@ -530,7 +634,13 @@ If the user references a specific screen (visible as [Viewing: screen-id] in the
 Only ask a clarifying question if the request is genuinely ambiguous. Default to your best inference.`;
 }
 
-// Spec §17.11 — Op 2.6 Drift Check
+/**
+ * Op 2.6 — Drift Check. Slug: `drift-check`.
+ *
+ * Classifies a proposed Phase 2 change against the locked Phase 1 contract.
+ * Returns COMPATIBLE (proceed), FLAG (warn user, user chooses), or DRIFT
+ * (block + require rollback). Parser: `parseDriftResult`. Spec §17.11.
+ */
 export function driftCheckPrompt(): string {
   return `You are a scope drift detector. You will receive a structured description of a proposed change to a product prototype, along with the locked project definition from a previous phase.
 
@@ -560,7 +670,12 @@ type: [drift type from list above, or NONE if compatible]
 reason: [one sentence explaining your classification]`;
 }
 
-// Spec §17.23 — Op 2.7c Targeted Screen Update
+/**
+ * Op 2.7c — Targeted Screen Update. Slug: `targeted-screen-update`.
+ *
+ * When the cascade router chose `screen_only` scope, this regenerates
+ * only the affected screen HTML. Parser: `parsePlainText`. Spec §17.23.
+ */
 export function targetedScreenUpdatePrompt(): string {
   return `You are a UX analyst updating a screen inventory. Apply ONLY the specified changes. Do not modify unaffected screens.
 
@@ -571,7 +686,13 @@ If a screen is modified, update only the changed fields.
 Produce the COMPLETE updated screen inventory in the same YAML format — including unchanged screens.`;
 }
 
-// Spec §17.24 — Op 2.7d Targeted Workflow Update
+/**
+ * Op 2.7d — Targeted Workflow Update. Slug: `targeted-workflow-update`.
+ *
+ * When the cascade router chose `workflow_change` scope, this partially
+ * re-runs the auto-gen chain (workflow + dependent screens + tests).
+ * Parser: `parsePlainText`. Spec §17.24.
+ */
 export function targetedWorkflowUpdatePrompt(): string {
   return `You are a product workflow designer updating an existing workflow. Apply the specified change while maintaining consistency.
 
@@ -582,7 +703,13 @@ If modifying steps, update edge cases that branch from the modified step if affe
 Produce the COMPLETE updated workflow definition in the same YAML format — including unchanged steps.`;
 }
 
-// Spec §17.25 — Op 2.9 Test Failure Diagnosis
+/**
+ * Op 2.9 — Test Failure Diagnosis. Slug: `test-failure-diagnosis`.
+ *
+ * Given a failed test, classifies root cause as WIREFRAME_BUG, TEST_BUG,
+ * or WORKFLOW_FLAW + proposes a fix. Parser: `parseDiagnosisResult`.
+ * Spec §17.25.
+ */
 export function diagnosisPrompt(): string {
   return `You are a test failure diagnostician. A test was run against a wireframe prototype and failed. Determine the root cause.
 
@@ -608,7 +735,16 @@ proposed_fix: [specific description of what needs to change]
 confidence: [high or medium or low]`;
 }
 
-// Spec §17.22 — Op 2.10 Phase 2 Validation
+/**
+ * Op 2.10 (Step 2) — Phase 2 Validation. Slug: `phase2-validation`.
+ *
+ * AI step of Phase 2 completion validation. Cross-references contract,
+ * workflows, tests, screens, wireframe files, and test results for
+ * completeness + consistency. Returns PASS/FAIL + issues + suggestions +
+ * warnings. Only runs if code-level checks (Step 1 in
+ * `op-2-10-validation.ts`) pass. Parser: `parseValidationResult`.
+ * Spec §17.22.
+ */
 export function phase2ValidationPrompt(): string {
   return `You are a product completeness validator for Phase 2 (artifact generation). Your job is to check whether the generated artifacts are complete, consistent, and ready for handoff.
 

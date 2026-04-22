@@ -147,12 +147,12 @@ export class Phase1HandlersImpl implements Phase1Handlers {
       await transitionPhase(this.deps.storage, sessionId, "phase-1", "complete");
       sse.send({
         type: "phase",
-        data: { from: "phase-1", to: "phase-1", status: "complete" },
+        data: { phaseId: "phase-1", status: "complete" },
       });
     } else {
       sse.send({
         type: "phase",
-        data: { from: "phase-1", to: "phase-1", status: "active" },
+        data: { phaseId: "phase-1", status: "active" },
       });
     }
 

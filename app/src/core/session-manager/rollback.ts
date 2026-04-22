@@ -68,7 +68,7 @@ export async function executeRollback(
 
   sse.send({
     type: "phase",
-    data: { from: "phase-2", to: "phase-1", status: "active" },
+    data: { phaseId: "phase-1", status: "active" },
   });
 
   sse.sendProgress({
@@ -129,7 +129,7 @@ export async function restorePhase2(
 
   sse.send({
     type: "phase",
-    data: { from: "phase-1", to: "phase-2", status: "active", detail: "restored" },
+    data: { phaseId: "phase-2", status: "active", detail: "restored" },
   });
 }
 
