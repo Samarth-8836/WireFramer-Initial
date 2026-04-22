@@ -13,12 +13,23 @@ import type { ParseResult } from "@core/types";
 // LLMs love wrapping output in fenced code blocks even when you ask them not to.
 // Strip the leading and trailing fences but leave the body intact. Handles
 // ```yaml ...```, ```json ...```, ```...``` (no language tag), and bare ```.
+//
+// Also handles the "helpful preamble" pattern: "Sure, here's the data:\n```yaml\n...\n```"
+// by extracting the first complete fence block when full-string fencing fails.
 function stripCodeFences(text: string): string {
   const trimmed = text.trim();
   // Match opening fence (with optional language tag) and closing fence.
-  const fenceRegex = /^```(?:\w+)?\s*\n?([\s\S]*?)\n?```$/;
-  const m = trimmed.match(fenceRegex);
-  if (m) return m[1].trim();
+  const fullRegex = /^```(?:\w+)?\s*\n?([\s\S]*?)\n?```$/;
+  const fullMatch = trimmed.match(fullRegex);
+  if (fullMatch) return fullMatch[1].trim();
+
+  // Fallback: find the first fence pair anywhere in the text. Handles
+  // preamble like "Here's the YAML:\n```yaml\n...\n```" and postamble
+  // like "```yaml\n...\n```\nLet me know if you want changes."
+  const anywhereRegex = /```(?:\w+)?\s*\n?([\s\S]*?)\n?```/;
+  const anywhereMatch = trimmed.match(anywhereRegex);
+  if (anywhereMatch) return anywhereMatch[1].trim();
+
   return trimmed;
 }
 
