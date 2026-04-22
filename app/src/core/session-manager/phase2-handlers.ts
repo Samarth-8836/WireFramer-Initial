@@ -81,6 +81,24 @@ export class Phase2HandlersImpl implements Phase2Handlers {
   // Called by SessionManager when Phase 1 completes and the session
   // transitions to Phase 2. Runs the full auto-generation chain.
   async runAutoGeneration(sessionId: string, sse: SSEWriter): Promise<void> {
+    // Ensure a phase-2 state record exists before transitioning. For a
+    // fresh session that just finished Phase 1, there's no phase-2 row
+    // yet — transitionPhase would throw "no phase state" without this.
+    const existing = await this.deps.storage.getPhaseState(
+      sessionId,
+      "phase-2",
+    );
+    if (!existing) {
+      await this.deps.storage.upsertPhaseState({
+        sessionId,
+        phaseId: "phase-2",
+        status: "not_started",
+        enteredAt: null,
+        completedAt: null,
+        suspendedAt: null,
+      });
+    }
+
     // Initialize Phase 2 state.
     await transitionPhase(
       this.deps.storage,

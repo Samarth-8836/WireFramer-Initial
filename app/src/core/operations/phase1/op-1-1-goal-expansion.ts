@@ -5,6 +5,7 @@ import type {
   TwoAIResult,
 } from "@core/operation-executor";
 import {
+  createVisibleChunkFilter,
   executeTwoAIPattern,
   extractGenerationContext,
   parseMarkdownSections,
@@ -44,6 +45,11 @@ export async function executeGoalExpansion(
   const callAContext =
     await contextBuilder.buildPhase1FirstMessage(userMessage);
 
+  // Strip the <generation_context> block from the streamed chat bubble so
+  // the user only sees the 1-2 sentence visible prefix. The full raw text
+  // is still captured server-side by the executor and passed to Call B.
+  const chunkFilter = createVisibleChunkFilter((text) => sse.sendChunk(text));
+
   const callADef: OperationDefinition = {
     operationId: "op-1-1",
     systemPrompt: callAContext.systemPrompt,
@@ -55,10 +61,10 @@ export async function executeGoalExpansion(
       "Include a <generation_context> YAML block containing the complete product definition (goal, personas, entities, boundaries). Keep your visible chat message to 1-2 sentences.",
     timeoutMs: 120_000,
     role: "reasoning",
-    onStreamChunk: (chunk) => sse.sendChunk(chunk),
+    onStreamChunk: (chunk) => chunkFilter.push(chunk),
   };
 
-  return executeTwoAIPattern(
+  const result = await executeTwoAIPattern(
     executor,
     callADef,
     async (contextData) => {
@@ -91,6 +97,11 @@ export async function executeGoalExpansion(
     },
     { sessionId },
   );
+
+  // If Call A asked a clarifying question (no <generation_context> tag),
+  // flush the held-back tail so the user sees the full question.
+  chunkFilter.flush();
+  return result;
 }
 
 // The generation_context may come back as a parsed YAML object or as the

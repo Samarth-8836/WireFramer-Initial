@@ -53,11 +53,9 @@ export async function POST(req: NextRequest): Promise<Response> {
   void (async () => {
     try {
       if (!body.sessionId) {
-        writer.sendMeta({ event: "session_created" });
-        const session = await sessionManager.createSession(message, writer);
-        // Emit a second meta event with the actual session id so the
-        // client can save it and reuse on follow-up messages.
-        writer.sendMeta({ event: "session_info", sessionId: session.id });
+        // SessionManager.createSession emits `session_info` itself, before
+        // the stream is closed by sendComplete inside handleFirstMessage.
+        await sessionManager.createSession(message, writer);
       } else {
         writer.sendMeta({ event: "message_ack", sessionId: body.sessionId });
         await sessionManager.handleMessage(

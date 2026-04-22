@@ -69,6 +69,10 @@ export interface Phase2Handlers {
     screenRef: string | null,
     sse: SSEWriter,
   ): Promise<void>;
+  // Phase 2 auto-generation chain (Ops 2.1a-2.5e). Kicked off by
+  // SessionManager.completePhase when Phase 1 validates PASS, or via the
+  // /api/phase2/start route for manual retriggering.
+  runAutoGeneration(sessionId: string, sse: SSEWriter): Promise<void>;
   // Phase 2 completion: export artifacts + Op 2.9 validation pass.
   completePhase(sessionId: string, sse: SSEWriter): Promise<void>;
 }
@@ -123,6 +127,13 @@ export class SessionManager {
       documentSnapshots: [],
       artifactSnapshots: [],
     });
+
+    // Tell the client the new session id BEFORE handleFirstMessage runs —
+    // that handler ends with sse.sendComplete() which closes the stream,
+    // and any meta emitted after a close is silently dropped. Emitting
+    // here is what the client's `session_info` handler uses to set
+    // activeSessionId, so follow-up messages route to the right session.
+    sse.sendMeta({ event: "session_info", sessionId });
 
     // Hold the lock for the duration of the first-message handler so a
     // racing follow-up message gets rejected rather than interleaving.
@@ -225,6 +236,10 @@ export class SessionManager {
 
   // Complete the current phase. Delegates to the phase-specific completion
   // handler, which owns the validation + transition + bootstrap flow.
+  //
+  // On a Phase 1 PASS this method chains straight into Phase 2 auto-gen
+  // on the same SSE stream — there's no separate UI trigger for Phase 2,
+  // so completing Phase 1 implicitly starts the generation chain.
   async completePhase(sessionId: string, sse: SSEWriter): Promise<void> {
     if (!this.tryAcquireLock(sessionId)) {
       sse.sendError("Please wait for the current operation to complete.");
@@ -242,6 +257,20 @@ export class SessionManager {
 
       if (session.currentPhaseId === "phase-1") {
         await this.handlers.phase1.completePhase(sessionId, sse);
+
+        // On PASS, phase-1's status is now "complete". Chain straight into
+        // Phase 2 auto-gen so the user doesn't have to click anything else.
+        // On FAIL, phase-1 stays "active" — close the stream here.
+        const phase1State = await this.storage.getPhaseState(
+          sessionId,
+          "phase-1",
+        );
+        if (phase1State?.status === "complete") {
+          // runAutoGeneration owns the sendComplete at the end of its chain.
+          await this.handlers.phase2.runAutoGeneration(sessionId, sse);
+        } else {
+          sse.sendComplete({ validation: "FAIL" });
+        }
       } else {
         await this.handlers.phase2.completePhase(sessionId, sse);
       }

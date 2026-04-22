@@ -42,6 +42,11 @@ export {
 } from "./streaming";
 
 export {
+  createVisibleChunkFilter,
+  type VisibleChunkFilter,
+} from "./visible-chunk-filter";
+
+export {
   executeTwoAIPattern,
   type TwoAIResult,
   type ExtractedContext,

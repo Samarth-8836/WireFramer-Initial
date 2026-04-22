@@ -165,7 +165,9 @@ export class Phase1HandlersImpl implements Phase1Handlers {
       },
     });
 
-    sse.sendComplete({ validation: result.status });
+    // Don't sendComplete here — the SessionManager's completePhase will
+    // decide what comes next. On PASS it chains into phase-2 auto-gen
+    // (which sendComplete's itself); on FAIL it closes the stream.
   }
 
   // ---------- internals ----------
@@ -198,13 +200,25 @@ export class Phase1HandlersImpl implements Phase1Handlers {
     result: TwoAIResult,
     sse: SSEWriter,
   ): Promise<void> {
+    // If Call A produced no visible prose (the whole response started with
+    // <generation_context>), fall back to a sensible default so rehydrating
+    // the session from storage doesn't yield a blank bubble. Without this,
+    // the user sees streamed text live but an empty bubble after a session
+    // switch.
+    const persistedContent =
+      result.visibleResponse.trim().length > 0
+        ? result.visibleResponse
+        : result.generatedDocument
+          ? "Updated the project contract."
+          : "";
+
     await this.deps.storage.addMessage({
       id: uuidv4(),
       sessionId,
       phaseId: "phase-1",
       role: "assistant",
       type: "chat",
-      content: result.visibleResponse,
+      content: persistedContent,
       metadata: {
         screenReference: null,
         generationContext: result.structuredData

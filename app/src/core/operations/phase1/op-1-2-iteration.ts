@@ -5,6 +5,7 @@ import type {
   TwoAIResult,
 } from "@core/operation-executor";
 import {
+  createVisibleChunkFilter,
   executeTwoAIPattern,
   extractGenerationContext,
   parseMarkdownSections,
@@ -41,6 +42,9 @@ export async function executeIteration(
     userMessage,
   );
 
+  // Strip the <generation_context> block from the streamed chat bubble.
+  const chunkFilter = createVisibleChunkFilter((text) => sse.sendChunk(text));
+
   const callADef: OperationDefinition = {
     operationId: "op-1-2",
     systemPrompt: callAContext.systemPrompt,
@@ -52,10 +56,10 @@ export async function executeIteration(
       "Respond with a 1-2 sentence chat message followed by a <generation_context> YAML block containing the COMPLETE updated product definition — not just the change.",
     timeoutMs: 120_000,
     role: "reasoning",
-    onStreamChunk: (chunk) => sse.sendChunk(chunk),
+    onStreamChunk: (chunk) => chunkFilter.push(chunk),
   };
 
-  return executeTwoAIPattern(
+  const result = await executeTwoAIPattern(
     executor,
     callADef,
     async (contextData) => {
@@ -88,6 +92,11 @@ export async function executeIteration(
     },
     { sessionId },
   );
+
+  // Flush any held-back tail in case Call A asked a clarifying question
+  // (no <generation_context> tag means nothing triggered the filter's stop).
+  chunkFilter.flush();
+  return result;
 }
 
 function normalizeGenerationContext(value: unknown): string {

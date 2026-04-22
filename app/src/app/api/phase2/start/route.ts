@@ -2,7 +2,6 @@ import type { NextRequest } from "next/server";
 
 import { getBootstrap } from "@core/bootstrap";
 import { createSSEResponse, SSEWriter } from "@core/operation-executor";
-import { Phase2HandlersImpl } from "@core/session-manager";
 
 // POST /api/phase2/start
 //
@@ -48,10 +47,15 @@ export async function POST(req: NextRequest): Promise<Response> {
   const writer = new SSEWriter();
   const response = createSSEResponse(writer);
 
-  const bootstrap = getBootstrap();
-  const phase2Handlers = bootstrap.sessionManager[
-    "handlers"
-  ].phase2 as Phase2HandlersImpl;
+  // runAutoGeneration is part of the Phase2Handlers interface; reach it
+  // via the session manager's injected handlers.
+  const phase2Handlers = (
+    getBootstrap().sessionManager as unknown as {
+      handlers: {
+        phase2: import("@core/session-manager").Phase2Handlers;
+      };
+    }
+  ).handlers.phase2;
 
   void (async () => {
     try {

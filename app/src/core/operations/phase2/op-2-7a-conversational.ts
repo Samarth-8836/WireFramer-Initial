@@ -6,7 +6,10 @@
 
 import type { ContextBuilder } from "@core/context-builder";
 import type { OperationExecutor, SSEWriter } from "@core/operation-executor";
-import { extractChangeContext } from "@core/operation-executor";
+import {
+  createVisibleChunkFilter,
+  extractChangeContext,
+} from "@core/operation-executor";
 import type { OperationDefinition } from "@core/types";
 
 export interface Phase2ConversationalResult {
@@ -30,6 +33,9 @@ export async function executePhase2Conversational(
     screenRef,
   );
 
+  // Strip the <change_context> block from the streamed chat bubble.
+  const chunkFilter = createVisibleChunkFilter((text) => sse.sendChunk(text));
+
   const def: OperationDefinition = {
     operationId: "op-2-7a",
     systemPrompt: context.systemPrompt,
@@ -41,10 +47,11 @@ export async function executePhase2Conversational(
       "Include a <change_context> block with scope and description, or ask a clarifying question.",
     timeoutMs: 120_000,
     role: "reasoning",
-    onStreamChunk: (chunk) => sse.sendChunk(chunk),
+    onStreamChunk: (chunk) => chunkFilter.push(chunk),
   };
 
   const result = await executor.execute(def, { sessionId });
+  chunkFilter.flush();
   if (result.status === "failed" || !result.output) {
     throw new Error(`op-2-7a failed: ${result.error ?? "unknown"}`);
   }

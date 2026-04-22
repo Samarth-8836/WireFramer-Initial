@@ -58,6 +58,9 @@ function makePhase2Handlers(): Phase2Recorder {
         args: [sessionId, message, screenRef],
       });
     },
+    async runAutoGeneration(sessionId) {
+      calls.push({ method: "runAutoGeneration", args: [sessionId] });
+    },
     async completePhase(sessionId) {
       calls.push({ method: "completePhase-2", args: [sessionId] });
     },
@@ -139,6 +142,34 @@ describe("SessionManager.createSession", () => {
     const h = makeHarness();
     const session = await h.manager.createSession("hi", freshSSE());
     expect(h.manager.isBlocked(session.id)).toBe(false);
+  });
+
+  // Regression: session_info must be emitted BEFORE the handler that
+  // sendComplete's the stream. Earlier the chat route was emitting
+  // session_info *after* createSession returned, by which point the
+  // stream was already closed — the client never got the sessionId and
+  // follow-up messages spawned new sessions.
+  it("emits a session_info meta event synchronously after creating the session record", async () => {
+    const h = makeHarness();
+    const sse = new SSEWriter();
+    sse.createStream();
+    const emitted: Array<{ type: string; data: unknown }> = [];
+    const originalSend = sse.send.bind(sse);
+    sse.send = ((event: Parameters<typeof sse.send>[0]) => {
+      emitted.push({ type: event.type, data: event.data });
+      originalSend(event);
+    }) as typeof sse.send;
+
+    const session = await h.manager.createSession("hi", sse);
+
+    const metaEvents = emitted.filter((e) => e.type === "meta");
+    const sessionInfo = metaEvents.find(
+      (e) => (e.data as { event?: string }).event === "session_info",
+    );
+    expect(sessionInfo).toBeDefined();
+    expect((sessionInfo!.data as { sessionId: string }).sessionId).toBe(
+      session.id,
+    );
   });
 });
 
@@ -361,5 +392,47 @@ describe("SessionManager.completePhase", () => {
     expect(h.phase2.calls.map((c) => c.method)).toEqual([
       "completePhase-2",
     ]);
+  });
+
+  // Regression: after Phase 1 completion PASSes, SessionManager must
+  // chain straight into phase-2 auto-gen on the same SSE stream — there
+  // is no separate UI trigger.
+  it("chains into phase2.runAutoGeneration when phase-1 transitions to complete", async () => {
+    const h = makeHarness();
+    const session = await h.manager.createSession("hi", freshSSE());
+
+    // Simulate a PASS: phase1.completePhase would normally transition
+    // phase-1 to complete. Our recorder doesn't actually call
+    // transitionPhase, so manually flip the state after the recorder
+    // returns — emulated by monkey-patching the recorder.
+    h.phase1.completePhase = async (sid: string) => {
+      h.phase1.calls.push({ method: "completePhase-1", args: [sid] });
+      await h.storage.upsertPhaseState({
+        sessionId: sid,
+        phaseId: "phase-1",
+        status: "complete",
+        enteredAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        suspendedAt: null,
+      });
+    };
+
+    h.phase1.calls.length = 0;
+    await h.manager.completePhase(session.id, freshSSE());
+
+    expect(h.phase1.calls.map((c) => c.method)).toEqual(["completePhase-1"]);
+    expect(h.phase2.calls.map((c) => c.method)).toEqual(["runAutoGeneration"]);
+  });
+
+  it("does NOT chain to phase-2 when phase-1 completion returned FAIL", async () => {
+    const h = makeHarness();
+    const session = await h.manager.createSession("hi", freshSSE());
+    // Default recorder completePhase does nothing — phase-1 stays "active".
+    h.phase1.calls.length = 0;
+    await h.manager.completePhase(session.id, freshSSE());
+
+    expect(h.phase1.calls.map((c) => c.method)).toEqual(["completePhase-1"]);
+    // phase-2 handler never invoked.
+    expect(h.phase2.calls).toEqual([]);
   });
 });
