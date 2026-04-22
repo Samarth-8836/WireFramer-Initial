@@ -32,13 +32,18 @@ import {
   assembleTestBundle,
   executeTestDryRun,
 } from "@core/operations/phase2";
+import type { Phase2Stage } from "@core/types";
 
-import type { AutoGenRunners, AutoGenConditions } from "./auto-generation-graph";
-import { buildAutoGenerationGraph } from "./auto-generation-graph";
 import { CascadeExecutor } from "./cascade-executor";
 import { routeCascade } from "./cascade-router";
 import { DependencyGraphExecutor } from "./dependency-graph";
+import type { GraphNode } from "./dependency-graph";
 import { transitionPhase } from "./phase-state-machine";
+import {
+  canAdvanceStage,
+  setPhase2Stage,
+  stageAfterRunning,
+} from "./phase2-stage-machine";
 import type { Phase2Handlers } from "./session-manager";
 
 interface Phase2Deps {
@@ -49,24 +54,45 @@ interface Phase2Deps {
   dataDir: string;
 }
 
-// Shared state passed through the DAG via closures.
-// Each field is written by one op and read by later ops.
-interface ChainState {
+// Each stage has its own ephemeral state bag — the DAG nodes within a
+// stage read/write it via closure. Intermediate values that the NEXT
+// stage needs (e.g. the detailed workflow YAMLs that Op 2.2a consumes)
+// are recovered from the persisted `*.structuredData` documents at the
+// start of the next stage, so no state has to survive between stage
+// runs.
+interface DesignStageState {
   workflowStubs: unknown[];
   detailedWorkflows: string[];
   workflowMapContent: string;
   workflowMapStructuredData: string;
-  testCaseBlocks: string[];
-  coverageYaml: string;
-  testSuiteStructuredData: string;
   screenInventoryYaml: string;
   navValidationStatus: "pass" | "has_issues";
   navFixesYaml: string;
   finalScreenInventoryYaml: string;
-  dummyDataJson: string;
   screenIds: string[];
+}
+
+interface WireframeStageState {
+  workflowMapStructuredData: string;
+  finalScreenInventoryYaml: string;
+  screenIds: string[];
+  dummyDataJson: string;
   screenHtmlMap: Map<string, string>;
   smokeTestPassed: boolean;
+}
+
+interface TestSuiteStageState {
+  detailedWorkflows: string[];
+  workflowMapStructuredData: string;
+  testCaseBlocks: string[];
+  coverageYaml: string;
+  testSuiteStructuredData: string;
+}
+
+interface AutomatedTestsStageState {
+  screenIds: string[];
+  finalScreenInventoryYaml: string;
+  testCaseBlocks: string[];
   translatedTests: string[];
   dryRunHadFailures: boolean;
 }
@@ -78,88 +104,64 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     this.wireframeManager = new WireframeManager(deps.dataDir);
   }
 
-  // Called by SessionManager when Phase 1 completes and the session
-  // transitions to Phase 2. Runs the full auto-generation chain.
+  // Entry point called by SessionManager.completePhase after Phase 1
+  // PASSes. Initializes Phase 2 state (phase-2 → active, phase2Stage set)
+  // then runs Stage 1 (design). Subsequent stages are gated behind user
+  // approval via `advanceStage()`.
   async runAutoGeneration(sessionId: string, sse: SSEWriter): Promise<void> {
-    // Ensure a phase-2 state record exists before transitioning. For a
-    // fresh session that just finished Phase 1, there's no phase-2 row
-    // yet — transitionPhase would throw "no phase state" without this.
-    const existing = await this.deps.storage.getPhaseState(
-      sessionId,
-      "phase-2",
-    );
-    if (!existing) {
-      await this.deps.storage.upsertPhaseState({
-        sessionId,
-        phaseId: "phase-2",
-        status: "not_started",
-        enteredAt: null,
-        completedAt: null,
-        suspendedAt: null,
-      });
-    }
-
-    // Initialize Phase 2 state.
-    await transitionPhase(
-      this.deps.storage,
-      sessionId,
-      "phase-2",
-      "active",
-    );
-    await this.deps.storage.updateSession(sessionId, {
-      currentPhaseId: "phase-2",
-    });
-
-    sse.send({
-      type: "phase",
-      data: { phaseId: "phase-2", status: "active" },
-    });
-
-    const state: ChainState = {
-      workflowStubs: [],
-      detailedWorkflows: [],
-      workflowMapContent: "",
-      workflowMapStructuredData: "",
-      testCaseBlocks: [],
-      coverageYaml: "",
-      testSuiteStructuredData: "",
-      screenInventoryYaml: "",
-      navValidationStatus: "pass",
-      navFixesYaml: "",
-      finalScreenInventoryYaml: "",
-      dummyDataJson: "",
-      screenIds: [],
-      screenHtmlMap: new Map(),
-      smokeTestPassed: false,
-      translatedTests: [],
-      dryRunHadFailures: false,
-    };
-
-    const runners = this.buildRunners(sessionId, state, sse);
-    const conditions = this.buildConditions(state);
-    const graph = buildAutoGenerationGraph(runners, conditions);
-
-    const dagExecutor = new DependencyGraphExecutor({
-      onProgress: (opId, status) => {
-        sse.sendProgress({ operationId: opId, status });
-      },
-    });
-
     try {
-      await dagExecutor.execute(graph);
-
-      sse.send({
-        type: "phase",
-        data: {
-          phaseId: "phase-2",
-          status: "active",
-          detail: "Auto-generation complete",
-        },
-      });
-      sse.sendComplete({ event: "auto_generation_complete" });
+      await this.initializePhase2(sessionId, sse);
+      await this.runDesignStage(sessionId, sse);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      sse.sendError(`Auto-generation chain failed: ${msg}`, true);
+      sse.sendError(`Phase 2 design stage failed: ${msg}`, true);
+      sse.close();
+    }
+  }
+
+  // Called by /api/phase2/advance when the user clicks "Approve" on the
+  // current stage's review. Dispatches to the next stage runner based
+  // on the session's current phase2Stage.
+  async advanceStage(sessionId: string, sse: SSEWriter): Promise<void> {
+    const { storage } = this.deps;
+
+    try {
+      const session = await storage.getSession(sessionId);
+      if (!session) {
+        sse.sendError(`Session ${sessionId} not found.`, true);
+        sse.close();
+        return;
+      }
+
+      const current = session.phase2Stage ?? "not_started";
+      const { ok, next, reason } = canAdvanceStage(current);
+      if (!ok || !next) {
+        sse.sendError(reason ?? "Cannot advance stage.", true);
+        sse.close();
+        return;
+      }
+
+      switch (next) {
+        case "wireframe_running":
+          await this.runWireframeStage(sessionId, sse);
+          return;
+        case "test_suite_running":
+          await this.runTestSuiteStage(sessionId, sse);
+          return;
+        case "automated_tests_running":
+          await this.runAutomatedTestsStage(sessionId, sse);
+          return;
+        default:
+          sse.sendError(
+            `Unexpected next stage: ${next}. This is a bug.`,
+            true,
+          );
+          sse.close();
+          return;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      sse.sendError(`Stage advance failed: ${msg}`, true);
       sse.close();
     }
   }
@@ -254,9 +256,7 @@ export class Phase2HandlersImpl implements Phase2Handlers {
             reason: driftResult.reason,
           },
         });
-        // For now, proceed anyway. The UI will show a warning banner
-        // and let the user choose. A full implementation would wait
-        // for user confirmation before continuing.
+        // Proceed anyway — UI shows a warning banner.
       }
     }
 
@@ -274,7 +274,6 @@ export class Phase2HandlersImpl implements Phase2Handlers {
       detail: `Applying ${route.scope} change: ${route.description}`,
     });
 
-    // 5. Execute cascade.
     const cascadeExecutor = new CascadeExecutor({
       storage,
       executor,
@@ -313,7 +312,6 @@ export class Phase2HandlersImpl implements Phase2Handlers {
         sessionId,
       );
 
-      // Persist validation result as a system message.
       const validationMessage = this.formatPhase2ValidationMessage(result);
       await storage.addMessage({
         id: uuidv4(),
@@ -334,7 +332,6 @@ export class Phase2HandlersImpl implements Phase2Handlers {
       if (result.overall === "PASS") {
         await transitionPhase(storage, sessionId, "phase-2", "completing");
         await transitionPhase(storage, sessionId, "phase-2", "complete");
-
         sse.send({
           type: "phase",
           data: { phaseId: "phase-2", status: "complete" },
@@ -346,7 +343,6 @@ export class Phase2HandlersImpl implements Phase2Handlers {
         });
       }
 
-      // Surface the detailed results.
       const issues = [
         ...result.codeChecks.failures,
         ...(result.aiValidation?.issues ?? []),
@@ -371,18 +367,562 @@ export class Phase2HandlersImpl implements Phase2Handlers {
     }
   }
 
+  // ── Stage runners ───────────────────────────────────────────
+
+  // Stage 1: Design — Workflow Map + Screen Inventory.
+  // Ops: 2.1a, 2.1b, 2.1c, 2.3a, 2.3b, 2.3c (conditional), 2.3d.
+  private async runDesignStage(
+    sessionId: string,
+    sse: SSEWriter,
+  ): Promise<void> {
+    const { storage, executor, promptRegistry } = this.deps;
+
+    await setPhase2Stage(storage, sessionId, "design_running");
+    sse.sendStage({ stageName: "design", status: "running" });
+
+    const state: DesignStageState = {
+      workflowStubs: [],
+      detailedWorkflows: [],
+      workflowMapContent: "",
+      workflowMapStructuredData: "",
+      screenInventoryYaml: "",
+      navValidationStatus: "pass",
+      navFixesYaml: "",
+      finalScreenInventoryYaml: "",
+      screenIds: [],
+    };
+
+    const nodes: GraphNode[] = [
+      {
+        operationId: "op-2-1a",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeWorkflowDiscovery(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+          );
+          state.workflowStubs = r.workflows;
+        },
+      },
+      {
+        operationId: "op-2-1b",
+        dependencies: ["op-2-1a"],
+        execute: async () => {
+          const r = await executeWorkflowDetailBatch(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+            state.workflowStubs,
+          );
+          state.detailedWorkflows = r.detailedWorkflows;
+        },
+      },
+      {
+        operationId: "op-2-1c",
+        dependencies: ["op-2-1b"],
+        execute: async () => {
+          const r = await executeWorkflowMapFormatting(
+            executor,
+            promptRegistry,
+            state.detailedWorkflows,
+            sessionId,
+          );
+          state.workflowMapContent = r.content;
+          state.workflowMapStructuredData = r.structuredData;
+
+          await storage.createDocument({
+            id: uuidv4(),
+            sessionId,
+            phaseId: "phase-2",
+            type: "workflow_map",
+            content: r.content,
+            structuredData: r.structuredData,
+            version: 1,
+            status: "active",
+            createdAt: new Date().toISOString(),
+            lastModifiedAt: new Date().toISOString(),
+          });
+          sse.sendDocument({
+            type: "workflow_map",
+            content: r.content,
+            version: 1,
+          });
+        },
+      },
+      {
+        operationId: "op-2-3a",
+        dependencies: ["op-2-1c"],
+        execute: async () => {
+          const r = await executeScreenExtraction(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+            state.workflowMapStructuredData,
+          );
+          state.screenInventoryYaml = r.screenInventoryYaml;
+        },
+      },
+      {
+        operationId: "op-2-3b",
+        dependencies: ["op-2-3a"],
+        execute: async () => {
+          const r = await executeNavValidation(
+            executor,
+            promptRegistry,
+            state.screenInventoryYaml,
+            state.workflowMapStructuredData,
+            sessionId,
+          );
+          state.navValidationStatus = r.status;
+          state.navFixesYaml = r.fixesYaml;
+        },
+      },
+      {
+        operationId: "op-2-3c",
+        dependencies: ["op-2-3b"],
+        condition: async () => state.navValidationStatus === "has_issues",
+        execute: async () => {
+          const r = await executeScreenCorrection(
+            executor,
+            promptRegistry,
+            state.screenInventoryYaml,
+            state.navFixesYaml,
+            sessionId,
+          );
+          state.finalScreenInventoryYaml = r.correctedScreenInventoryYaml;
+        },
+      },
+      {
+        operationId: "op-2-3d",
+        dependencies: ["op-2-3c"],
+        execute: async () => {
+          const yaml =
+            state.finalScreenInventoryYaml || state.screenInventoryYaml;
+          state.finalScreenInventoryYaml = yaml;
+          state.screenIds = extractScreenIdsFromYaml(yaml);
+
+          const r = await executeScreenInventoryFormatting(
+            executor,
+            promptRegistry,
+            yaml,
+            sessionId,
+          );
+
+          await storage.createDocument({
+            id: uuidv4(),
+            sessionId,
+            phaseId: "phase-2",
+            type: "screen_inventory",
+            content: r.content,
+            structuredData: r.structuredData,
+            version: 1,
+            status: "active",
+            createdAt: new Date().toISOString(),
+            lastModifiedAt: new Date().toISOString(),
+          });
+          sse.sendDocument({
+            type: "screen_inventory",
+            content: r.content,
+            version: 1,
+          });
+        },
+      },
+    ];
+
+    const dag = new DependencyGraphExecutor({
+      onProgress: (opId, status) => {
+        sse.sendProgress({ operationId: opId, status });
+      },
+    });
+
+    await dag.execute(nodes);
+
+    await setPhase2Stage(
+      storage,
+      sessionId,
+      stageAfterRunning("design_running"),
+    );
+    sse.sendStage({
+      stageName: "design",
+      status: "review",
+      detail:
+        "Review the Workflow Map and Screen Inventory, then click Approve to generate the wireframe.",
+    });
+    sse.sendComplete({ event: "design_stage_complete" });
+  }
+
+  // Stage 2: Wireframe — dummy data + shell + per-screen HTML + data.js.
+  // Ops: 2.4a, 2.4b, 2.4c, 2.4d, 2.4e.
+  private async runWireframeStage(
+    sessionId: string,
+    sse: SSEWriter,
+  ): Promise<void> {
+    const { storage, executor, promptRegistry } = this.deps;
+    const wm = this.wireframeManager;
+
+    await setPhase2Stage(storage, sessionId, "wireframe_running");
+    sse.sendStage({ stageName: "wireframe", status: "running" });
+
+    const prior = await readDesignStageOutputs(storage, sessionId);
+    const state: WireframeStageState = {
+      workflowMapStructuredData: prior.workflowMapStructuredData,
+      finalScreenInventoryYaml: prior.screenInventoryYaml,
+      screenIds: prior.screenIds,
+      dummyDataJson: "",
+      screenHtmlMap: new Map(),
+      smokeTestPassed: false,
+    };
+
+    const nodes: GraphNode[] = [
+      {
+        operationId: "op-2-4a",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeDummyDataGeneration(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+            state.workflowMapStructuredData,
+          );
+          state.dummyDataJson = r.dummyDataJson;
+        },
+      },
+      {
+        operationId: "op-2-4b",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeWireframeShell(
+            executor,
+            promptRegistry,
+            state.finalScreenInventoryYaml,
+            sessionId,
+          );
+          await wm.writeFile(sessionId, "index.html", r.shellHtml);
+        },
+      },
+      {
+        operationId: "op-2-4c",
+        dependencies: ["op-2-4a"],
+        execute: async () => {
+          const r = await executeScreenHtmlBatch(
+            executor,
+            promptRegistry,
+            state.finalScreenInventoryYaml,
+            state.dummyDataJson,
+            state.workflowMapStructuredData,
+            sessionId,
+          );
+          state.screenHtmlMap = r.screenHtmlMap;
+          for (const [screenId, html] of r.screenHtmlMap) {
+            await wm.writeFile(sessionId, `${screenId}.html`, html);
+          }
+        },
+      },
+      {
+        operationId: "op-2-4d",
+        dependencies: ["op-2-4c"],
+        execute: async () => {
+          const r = await executeWireframeSmokeTest(
+            wm,
+            sessionId,
+            state.screenIds,
+          );
+          state.smokeTestPassed = r.passed;
+          if (!r.passed) {
+            console.warn("Wireframe smoke test issues:", r.issues);
+          }
+        },
+      },
+      {
+        operationId: "op-2-4e",
+        dependencies: ["op-2-4a"],
+        execute: async () => {
+          const dataJs = assembleDataFile(state.dummyDataJson);
+          await wm.writeFile(sessionId, "data.js", dataJs);
+        },
+      },
+    ];
+
+    const dag = new DependencyGraphExecutor({
+      onProgress: (opId, status) => {
+        sse.sendProgress({ operationId: opId, status });
+      },
+    });
+
+    await dag.execute(nodes);
+
+    await setPhase2Stage(
+      storage,
+      sessionId,
+      stageAfterRunning("wireframe_running"),
+    );
+    sse.sendStage({
+      stageName: "wireframe",
+      status: "review",
+      detail:
+        "Wireframe ready. Click the Wireframe tab to explore, then Approve to generate the test suite.",
+    });
+    sse.sendComplete({ event: "wireframe_stage_complete" });
+  }
+
+  // Stage 3: Test Suite — test cases + coverage + formatted doc.
+  // Ops: 2.2a, 2.2b, 2.2c.
+  private async runTestSuiteStage(
+    sessionId: string,
+    sse: SSEWriter,
+  ): Promise<void> {
+    const { storage, executor, promptRegistry } = this.deps;
+
+    await setPhase2Stage(storage, sessionId, "test_suite_running");
+    sse.sendStage({ stageName: "test_suite", status: "running" });
+
+    const prior = await readDesignStageOutputs(storage, sessionId);
+    const state: TestSuiteStageState = {
+      detailedWorkflows: prior.detailedWorkflows,
+      workflowMapStructuredData: prior.workflowMapStructuredData,
+      testCaseBlocks: [],
+      coverageYaml: "",
+      testSuiteStructuredData: "",
+    };
+
+    const nodes: GraphNode[] = [
+      {
+        operationId: "op-2-2a",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeTestCaseGenerationBatch(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+            state.detailedWorkflows,
+          );
+          state.testCaseBlocks = r.testCaseBlocks;
+        },
+      },
+      {
+        operationId: "op-2-2b",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeEntityCoverageCheck(
+            executor,
+            promptRegistry,
+            storage,
+            sessionId,
+            state.workflowMapStructuredData,
+          );
+          state.coverageYaml = r.coverageYaml;
+        },
+      },
+      {
+        operationId: "op-2-2c",
+        dependencies: ["op-2-2a", "op-2-2b"],
+        execute: async () => {
+          const r = await executeTestSuiteFormatting(
+            executor,
+            promptRegistry,
+            state.testCaseBlocks,
+            state.coverageYaml,
+            sessionId,
+          );
+          state.testSuiteStructuredData = r.structuredData;
+
+          await storage.createDocument({
+            id: uuidv4(),
+            sessionId,
+            phaseId: "phase-2",
+            type: "test_suite",
+            content: r.content,
+            structuredData: r.structuredData,
+            version: 1,
+            status: "active",
+            createdAt: new Date().toISOString(),
+            lastModifiedAt: new Date().toISOString(),
+          });
+          sse.sendDocument({
+            type: "test_suite",
+            content: r.content,
+            version: 1,
+          });
+        },
+      },
+    ];
+
+    const dag = new DependencyGraphExecutor({
+      onProgress: (opId, status) => {
+        sse.sendProgress({ operationId: opId, status });
+      },
+    });
+
+    await dag.execute(nodes);
+
+    await setPhase2Stage(
+      storage,
+      sessionId,
+      stageAfterRunning("test_suite_running"),
+    );
+    sse.sendStage({
+      stageName: "test_suite",
+      status: "review",
+      detail:
+        "Test suite generated. Review it alongside the wireframe, then click Approve to generate executable tests.",
+    });
+    sse.sendComplete({ event: "test_suite_stage_complete" });
+  }
+
+  // Stage 4: Automated Tests — harness + translation + bundle + dry run + repair.
+  // Ops: 2.5a, 2.5b, 2.5c, 2.5d, 2.5e (conditional).
+  private async runAutomatedTestsStage(
+    sessionId: string,
+    sse: SSEWriter,
+  ): Promise<void> {
+    const { storage, executor, promptRegistry } = this.deps;
+    const wm = this.wireframeManager;
+
+    await setPhase2Stage(storage, sessionId, "automated_tests_running");
+    sse.sendStage({ stageName: "automated_tests", status: "running" });
+
+    const designOut = await readDesignStageOutputs(storage, sessionId);
+    const testSuiteOut = await readTestSuiteStageOutputs(storage, sessionId);
+    const state: AutomatedTestsStageState = {
+      screenIds: designOut.screenIds,
+      finalScreenInventoryYaml: designOut.screenInventoryYaml,
+      testCaseBlocks: testSuiteOut.testCaseBlocks,
+      translatedTests: [],
+      dryRunHadFailures: false,
+    };
+
+    const nodes: GraphNode[] = [
+      {
+        operationId: "op-2-5a",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeTestHarnessGeneration(
+            executor,
+            promptRegistry,
+            state.screenIds,
+            sessionId,
+          );
+          await wm.writeFile(sessionId, "test-harness.html", r.harnessHtml);
+        },
+      },
+      {
+        operationId: "op-2-5b",
+        dependencies: [],
+        execute: async () => {
+          const r = await executeTestTranslationBatch(
+            executor,
+            promptRegistry,
+            wm,
+            sessionId,
+            state.testCaseBlocks,
+            state.finalScreenInventoryYaml,
+          );
+          state.translatedTests = r.translatedTests;
+        },
+      },
+      {
+        operationId: "op-2-5c",
+        dependencies: ["op-2-5b"],
+        execute: async () => {
+          const testsJs = assembleTestBundle(state.translatedTests);
+          await wm.writeFile(sessionId, "tests.js", testsJs);
+        },
+      },
+      {
+        operationId: "op-2-5d",
+        dependencies: ["op-2-5c"],
+        execute: async () => {
+          const r = await executeTestDryRun();
+          state.dryRunHadFailures = r.results.some((x) => x.status === "fail");
+        },
+      },
+      {
+        operationId: "op-2-5e",
+        dependencies: ["op-2-5d"],
+        condition: async () => state.dryRunHadFailures,
+        execute: async () => {
+          // Real repair loop lives in Sprint 8; condition prevents it
+          // from running when the dry run is clean.
+        },
+      },
+    ];
+
+    const dag = new DependencyGraphExecutor({
+      onProgress: (opId, status) => {
+        sse.sendProgress({ operationId: opId, status });
+      },
+    });
+
+    await dag.execute(nodes);
+
+    await setPhase2Stage(
+      storage,
+      sessionId,
+      stageAfterRunning("automated_tests_running"),
+    );
+    sse.sendStage({
+      stageName: "automated_tests",
+      status: "complete",
+      detail:
+        "Automated tests generated. You can now click Done to run Phase 2 validation.",
+    });
+    sse.sendComplete({ event: "automated_tests_stage_complete" });
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────
+
+  // Transitions phase-2 state to active (creating it if missing) and
+  // marks the session as being in phase-2.
+  private async initializePhase2(
+    sessionId: string,
+    sse: SSEWriter,
+  ): Promise<void> {
+    const { storage } = this.deps;
+    const existing = await storage.getPhaseState(sessionId, "phase-2");
+    if (!existing) {
+      await storage.upsertPhaseState({
+        sessionId,
+        phaseId: "phase-2",
+        status: "not_started",
+        enteredAt: null,
+        completedAt: null,
+        suspendedAt: null,
+      });
+    }
+
+    await transitionPhase(storage, sessionId, "phase-2", "active");
+    await storage.updateSession(sessionId, {
+      currentPhaseId: "phase-2",
+      phase2Stage: "not_started" as Phase2Stage,
+    });
+
+    sse.send({
+      type: "phase",
+      data: { phaseId: "phase-2", status: "active" },
+    });
+  }
+
   private formatPhase2ValidationMessage(result: {
     codeChecks: { passed: boolean; failures: string[] };
-    aiValidation: { status: string; issues: string[]; warnings: string[]; suggestions: string[] } | null;
+    aiValidation: {
+      status: string;
+      issues: string[];
+      warnings: string[];
+      suggestions: string[];
+    } | null;
     overall: string;
   }): string {
     const lines: string[] = [`STATUS: ${result.overall}`];
-
     if (result.codeChecks.failures.length > 0) {
       lines.push("", "Code check failures:");
       for (const f of result.codeChecks.failures) lines.push(`- ${f}`);
     }
-
     if (result.aiValidation) {
       if (result.aiValidation.issues.length > 0) {
         lines.push("", "AI validation issues:");
@@ -397,259 +937,76 @@ export class Phase2HandlersImpl implements Phase2Handlers {
         for (const s of result.aiValidation.suggestions) lines.push(`- ${s}`);
       }
     }
-
     return lines.join("\n");
   }
+}
 
-  // ── Build all 20 DAG runners ─────────────────────────────────
+// ── Stage output recovery (free functions) ────────────────────
 
-  private buildRunners(
-    sessionId: string,
-    state: ChainState,
-    sse: SSEWriter,
-  ): AutoGenRunners {
-    const { storage, executor, promptRegistry } = this.deps;
-    const wm = this.wireframeManager;
+async function readDesignStageOutputs(
+  storage: IStorage,
+  sessionId: string,
+): Promise<{
+  workflowMapStructuredData: string;
+  detailedWorkflows: string[];
+  screenInventoryYaml: string;
+  screenIds: string[];
+}> {
+  const [workflowMap, screenInventory] = await Promise.all([
+    storage.getActiveDocument(sessionId, "workflow_map"),
+    storage.getActiveDocument(sessionId, "screen_inventory"),
+  ]);
 
-    return {
-      // Workflow Map
-      "op-2-1a": async () => {
-        const result = await executeWorkflowDiscovery(
-          executor, promptRegistry, storage, sessionId,
-        );
-        state.workflowStubs = result.workflows;
-      },
-
-      "op-2-1b": async () => {
-        const result = await executeWorkflowDetailBatch(
-          executor, promptRegistry, storage, sessionId, state.workflowStubs,
-        );
-        state.detailedWorkflows = result.detailedWorkflows;
-      },
-
-      "op-2-1c": async () => {
-        const result = await executeWorkflowMapFormatting(
-          executor, promptRegistry, state.detailedWorkflows, sessionId,
-        );
-        state.workflowMapContent = result.content;
-        state.workflowMapStructuredData = result.structuredData;
-
-        await storage.createDocument({
-          id: uuidv4(),
-          sessionId,
-          phaseId: "phase-2",
-          type: "workflow_map",
-          content: result.content,
-          structuredData: result.structuredData,
-          version: 1,
-          status: "active",
-          createdAt: new Date().toISOString(),
-          lastModifiedAt: new Date().toISOString(),
-        });
-        sse.sendDocument({
-          type: "workflow_map",
-          content: result.content,
-          version: 1,
-        });
-      },
-
-      // Test Suite
-      "op-2-2a": async () => {
-        const result = await executeTestCaseGenerationBatch(
-          executor, promptRegistry, storage, sessionId,
-          state.detailedWorkflows,
-        );
-        state.testCaseBlocks = result.testCaseBlocks;
-      },
-
-      "op-2-2b": async () => {
-        const result = await executeEntityCoverageCheck(
-          executor, promptRegistry, storage, sessionId,
-          state.workflowMapStructuredData,
-        );
-        state.coverageYaml = result.coverageYaml;
-      },
-
-      "op-2-2c": async () => {
-        const result = await executeTestSuiteFormatting(
-          executor, promptRegistry,
-          state.testCaseBlocks, state.coverageYaml, sessionId,
-        );
-        state.testSuiteStructuredData = result.structuredData;
-
-        await storage.createDocument({
-          id: uuidv4(),
-          sessionId,
-          phaseId: "phase-2",
-          type: "test_suite",
-          content: result.content,
-          structuredData: result.structuredData,
-          version: 1,
-          status: "active",
-          createdAt: new Date().toISOString(),
-          lastModifiedAt: new Date().toISOString(),
-        });
-        sse.sendDocument({
-          type: "test_suite",
-          content: result.content,
-          version: 1,
-        });
-      },
-
-      // Screen Inventory
-      "op-2-3a": async () => {
-        const result = await executeScreenExtraction(
-          executor, promptRegistry, storage, sessionId,
-          state.workflowMapStructuredData,
-        );
-        state.screenInventoryYaml = result.screenInventoryYaml;
-      },
-
-      "op-2-3b": async () => {
-        const result = await executeNavValidation(
-          executor, promptRegistry,
-          state.screenInventoryYaml,
-          state.workflowMapStructuredData,
-          sessionId,
-        );
-        state.navValidationStatus = result.status;
-        state.navFixesYaml = result.fixesYaml;
-      },
-
-      "op-2-3c": async () => {
-        const result = await executeScreenCorrection(
-          executor, promptRegistry,
-          state.screenInventoryYaml,
-          state.navFixesYaml,
-          sessionId,
-        );
-        state.finalScreenInventoryYaml = result.correctedScreenInventoryYaml;
-      },
-
-      "op-2-3d": async () => {
-        const yaml =
-          state.finalScreenInventoryYaml || state.screenInventoryYaml;
-        state.finalScreenInventoryYaml = yaml;
-
-        // Extract screen IDs for later ops.
-        try {
-          const parsed = parseYamlLib(yaml) as Record<string, unknown>;
-          const screens = (parsed.screens ?? []) as Record<string, unknown>[];
-          state.screenIds = screens.map((s) => s.id as string);
-        } catch {
-          state.screenIds = [];
-        }
-
-        const result = await executeScreenInventoryFormatting(
-          executor, promptRegistry, yaml, sessionId,
-        );
-
-        await storage.createDocument({
-          id: uuidv4(),
-          sessionId,
-          phaseId: "phase-2",
-          type: "screen_inventory",
-          content: result.content,
-          structuredData: result.structuredData,
-          version: 1,
-          status: "active",
-          createdAt: new Date().toISOString(),
-          lastModifiedAt: new Date().toISOString(),
-        });
-        sse.sendDocument({
-          type: "screen_inventory",
-          content: result.content,
-          version: 1,
-        });
-      },
-
-      // Wireframe HTML
-      "op-2-4a": async () => {
-        const result = await executeDummyDataGeneration(
-          executor, promptRegistry, storage, sessionId,
-          state.workflowMapStructuredData,
-        );
-        state.dummyDataJson = result.dummyDataJson;
-      },
-
-      "op-2-4b": async () => {
-        const result = await executeWireframeShell(
-          executor, promptRegistry,
-          state.finalScreenInventoryYaml,
-          sessionId,
-        );
-        await wm.writeFile(sessionId, "index.html", result.shellHtml);
-      },
-
-      "op-2-4c": async () => {
-        const result = await executeScreenHtmlBatch(
-          executor, promptRegistry,
-          state.finalScreenInventoryYaml,
-          state.dummyDataJson,
-          state.workflowMapStructuredData,
-          sessionId,
-        );
-        state.screenHtmlMap = result.screenHtmlMap;
-        for (const [screenId, html] of result.screenHtmlMap) {
-          await wm.writeFile(sessionId, `${screenId}.html`, html);
-        }
-      },
-
-      "op-2-4d": async () => {
-        const result = await executeWireframeSmokeTest(
-          wm, sessionId, state.screenIds,
-        );
-        state.smokeTestPassed = result.passed;
-        if (!result.passed) {
-          console.warn("Wireframe smoke test issues:", result.issues);
-        }
-      },
-
-      "op-2-4e": async () => {
-        const dataJs = assembleDataFile(state.dummyDataJson);
-        await wm.writeFile(sessionId, "data.js", dataJs);
-      },
-
-      // Automated Tests
-      "op-2-5a": async () => {
-        const result = await executeTestHarnessGeneration(
-          executor, promptRegistry, state.screenIds, sessionId,
-        );
-        await wm.writeFile(sessionId, "test-harness.html", result.harnessHtml);
-      },
-
-      "op-2-5b": async () => {
-        const result = await executeTestTranslationBatch(
-          executor, promptRegistry, wm, sessionId,
-          state.testCaseBlocks,
-          state.finalScreenInventoryYaml,
-        );
-        state.translatedTests = result.translatedTests;
-      },
-
-      "op-2-5c": async () => {
-        const testsJs = assembleTestBundle(state.translatedTests);
-        await wm.writeFile(sessionId, "tests.js", testsJs);
-      },
-
-      "op-2-5d": async () => {
-        const result = await executeTestDryRun();
-        state.dryRunHadFailures = result.results.some(
-          (r) => r.status === "fail",
-        );
-      },
-
-      "op-2-5e": async () => {
-        // Placeholder — real repair loop is Sprint 8.
-        // The condition prevents this from running when dry run shows no failures.
-      },
-    };
+  if (!workflowMap) {
+    throw new Error(
+      "Workflow Map not found — cannot run this stage without Stage 1 output.",
+    );
+  }
+  if (!screenInventory) {
+    throw new Error(
+      "Screen Inventory not found — cannot run this stage without Stage 1 output.",
+    );
   }
 
-  private buildConditions(state: ChainState): AutoGenConditions {
-    return {
-      "op-2-3c": async () => state.navValidationStatus === "has_issues",
-      "op-2-5e": async () => state.dryRunHadFailures,
-    };
+  // structuredData for workflow_map is detailedWorkflows joined by "\n---\n"
+  const detailedWorkflows = workflowMap.structuredData
+    .split(/\n---\n/)
+    .filter((s) => s.trim().length > 0);
+
+  const screenInventoryYaml = screenInventory.structuredData;
+  const screenIds = extractScreenIdsFromYaml(screenInventoryYaml);
+
+  return {
+    workflowMapStructuredData: workflowMap.structuredData,
+    detailedWorkflows,
+    screenInventoryYaml,
+    screenIds,
+  };
+}
+
+async function readTestSuiteStageOutputs(
+  storage: IStorage,
+  sessionId: string,
+): Promise<{ testCaseBlocks: string[] }> {
+  const testSuite = await storage.getActiveDocument(sessionId, "test_suite");
+  if (!testSuite) {
+    throw new Error(
+      "Test Suite not found — cannot run this stage without Stage 3 output.",
+    );
+  }
+  // structuredData for test_suite is testCaseBlocks joined by "\n---\n"
+  const testCaseBlocks = testSuite.structuredData
+    .split(/\n---\n/)
+    .filter((s) => s.trim().length > 0);
+  return { testCaseBlocks };
+}
+
+function extractScreenIdsFromYaml(yaml: string): string[] {
+  try {
+    const parsed = parseYamlLib(yaml) as Record<string, unknown>;
+    const screens = (parsed.screens ?? []) as Record<string, unknown>[];
+    return screens.map((s) => s.id as string).filter(Boolean);
+  } catch {
+    return [];
   }
 }

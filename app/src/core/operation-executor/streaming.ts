@@ -7,7 +7,8 @@
 export type SSEEventType =
   | "chunk"            // Text delta for chat — { text: string }
   | "document"         // Document created/updated — { type, content, version, ... }
-  | "phase"            // Phase transition — { from, to, status }
+  | "phase"            // Phase transition — { phaseId, status, detail? }
+  | "stage"            // Phase 2 sub-stage state — { stageName, status: "running"|"review"|"complete", detail? }
   | "progress"         // Operation progress — { operationId, status, detail? }
   | "test_results"     // Test execution results — { totalTests, passed, failed, ... }
   | "drift"            // Drift detection result — { classification, type, reason }
@@ -75,6 +76,14 @@ export class SSEWriter {
     [k: string]: unknown;
   }): void {
     this.send({ type: "document", data: doc });
+  }
+
+  sendStage(info: {
+    stageName: "design" | "wireframe" | "test_suite" | "automated_tests";
+    status: "running" | "review" | "complete";
+    detail?: string;
+  }): void {
+    this.send({ type: "stage", data: info });
   }
 
   sendError(error: string, fatal = false): void {

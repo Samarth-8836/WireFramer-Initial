@@ -61,6 +61,9 @@ function makePhase2Handlers(): Phase2Recorder {
     async runAutoGeneration(sessionId) {
       calls.push({ method: "runAutoGeneration", args: [sessionId] });
     },
+    async advanceStage(sessionId) {
+      calls.push({ method: "advanceStage", args: [sessionId] });
+    },
     async completePhase(sessionId) {
       calls.push({ method: "completePhase-2", args: [sessionId] });
     },

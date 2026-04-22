@@ -26,6 +26,11 @@ export class Phase2HandlersStub implements Phase2Handlers {
     sse.close();
   }
 
+  async advanceStage(_sessionId: string, sse: SSEWriter): Promise<void> {
+    sse.sendError("Phase 2 stage advance is not yet implemented.", true);
+    sse.close();
+  }
+
   async completePhase(_sessionId: string, sse: SSEWriter): Promise<void> {
     sse.sendError("Phase 2 completion is not yet implemented.", true);
     sse.close();

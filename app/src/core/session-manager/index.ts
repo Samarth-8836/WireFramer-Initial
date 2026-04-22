@@ -44,3 +44,14 @@ export {
   type ResumeReport,
   type InterruptedOperation,
 } from "./session-resume";
+export {
+  canAdvanceStage,
+  stageAfterRunning,
+  setPhase2Stage,
+  getPhase2Stage,
+  isRunning as isPhase2StageRunning,
+  isReview as isPhase2StageReview,
+  PHASE2_STAGE_ORDER,
+  RUNNING_STAGES as PHASE2_RUNNING_STAGES,
+  REVIEW_STAGES as PHASE2_REVIEW_STAGES,
+} from "./phase2-stage-machine";

@@ -34,6 +34,7 @@ interface SendMessageOpts {
 interface UseSSEReturn {
   sendMessage: (opts: SendMessageOpts) => void;
   completePhase: (sessionId: string) => void;
+  advancePhase2Stage: (sessionId: string) => void;
   isConnected: boolean;
 }
 
@@ -105,9 +106,25 @@ export function useSSE(): UseSSEReturn {
     );
   }, []);
 
+  const advancePhase2Stage = useCallback((sessionId: string) => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    useChatStore.getState().startStreaming();
+
+    void consumeSSEStream(
+      "/api/phase2/advance",
+      { sessionId },
+      controller.signal,
+      undefined,
+    );
+  }, []);
+
   return {
     sendMessage,
     completePhase,
+    advancePhase2Stage,
     isConnected: connectedRef.current,
   };
 }
@@ -282,6 +299,53 @@ async function consumeSSEStream(
               reason: string;
             };
             chatStore().showDriftWarning(drift);
+            break;
+          }
+
+          case "stage": {
+            // Phase 2 sub-stage transition. Map the stageName + status
+            // into a phase2Stage enum value so the UI knows whether to
+            // show the spinner, the approve button, or the final state.
+            const stage = parsed.data as {
+              stageName:
+                | "design"
+                | "wireframe"
+                | "test_suite"
+                | "automated_tests";
+              status: "running" | "review" | "complete";
+              detail?: string;
+            };
+            const mapped =
+              stage.status === "complete"
+                ? "complete"
+                : (`${stage.stageName}_${stage.status}` as
+                    | "design_running"
+                    | "design_review"
+                    | "wireframe_running"
+                    | "wireframe_review"
+                    | "test_suite_running"
+                    | "test_suite_review"
+                    | "automated_tests_running");
+            sessionStore().setPhase2Stage(mapped);
+
+            // Surface the detail as a system message for chat context.
+            if (stage.detail) {
+              chatStore().addMessage({
+                id: `stage-${stage.stageName}-${stage.status}-${Date.now()}`,
+                sessionId: sessionStore().activeSessionId ?? "",
+                phaseId: "phase-2",
+                role: "system",
+                type: "system_notification",
+                content: `[${stage.stageName} · ${stage.status}] ${stage.detail}`,
+                metadata: {
+                  screenReference: null,
+                  generationContext: null,
+                  operationId: null,
+                  stale: false,
+                },
+                createdAt: new Date().toISOString(),
+              });
+            }
             break;
           }
 

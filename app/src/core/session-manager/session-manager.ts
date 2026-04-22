@@ -69,10 +69,13 @@ export interface Phase2Handlers {
     screenRef: string | null,
     sse: SSEWriter,
   ): Promise<void>;
-  // Phase 2 auto-generation chain (Ops 2.1a-2.5e). Kicked off by
-  // SessionManager.completePhase when Phase 1 validates PASS, or via the
-  // /api/phase2/start route for manual retriggering.
+  // Phase 2 entry point — initializes phase-2 state + runs Stage 1
+  // (design). Subsequent stages (wireframe, test suite, automated tests)
+  // are gated behind user approval and advanced via `advanceStage`.
   runAutoGeneration(sessionId: string, sse: SSEWriter): Promise<void>;
+  // Called by /api/phase2/advance when the user clicks "Approve" on the
+  // current stage's review. Dispatches to the next stage runner.
+  advanceStage(sessionId: string, sse: SSEWriter): Promise<void>;
   // Phase 2 completion: export artifacts + Op 2.9 validation pass.
   completePhase(sessionId: string, sse: SSEWriter): Promise<void>;
 }

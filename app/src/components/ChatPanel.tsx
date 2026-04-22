@@ -5,6 +5,7 @@ import { useEffect, useRef } from "react";
 import { useChatStore } from "@stores/chat-store";
 import { useSessionStore } from "@stores/session-store";
 
+import { ApproveStageButton } from "./ApproveStageButton";
 import { ChatInput } from "./ChatInput";
 import { DriftWarningBanner } from "./DriftWarning";
 
@@ -76,6 +77,9 @@ export function ChatPanel() {
 
       {/* Drift warning banner */}
       {driftWarning && <DriftWarningBanner />}
+
+      {/* Phase 2 stage approval — only renders on *_review stages */}
+      <ApproveStageButton />
 
       {/* Input */}
       <ChatInput />
