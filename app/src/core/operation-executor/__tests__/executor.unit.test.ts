@@ -28,11 +28,12 @@ class StubExecutor extends OperationExecutor {
   }
 
   // Relaxed signature for test-only override; the runtime contract matches
-  // the parent's streamCall — accept an args object with a `context` shape
-  // and return a StubResponse.
+  // the parent's streamCall — after the OpenRouter refactor the parent
+  // passes `{ modelId, systemPrompt, messages, apiKey, signal, onChunk }`,
+  // so we read messages directly off args.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async streamCall(args: any): Promise<StubResponse> {
-    this.lastMessages = args.context.messages as unknown[];
+    this.lastMessages = args.messages as unknown[];
     const idx = Math.min(this.callCount, this.responses.length - 1);
     this.callCount += 1;
     return this.responses[idx];

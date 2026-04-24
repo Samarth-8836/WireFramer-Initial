@@ -1,7 +1,10 @@
-import type { Context } from "@mariozechner/pi-ai";
-import { stream } from "@mariozechner/pi-ai";
-
-import { getApiKey, resolveModel } from "@core/llm/providers";
+import {
+  describeActiveConfig,
+  getApiKey,
+  getBaseUrl,
+  resolveModel,
+} from "@core/llm/providers";
+import { streamOpenRouter } from "@core/llm/openrouter-client";
 import type {
   LLMMessage,
   OperationDefinition,
@@ -15,23 +18,23 @@ import { buildRetryMessages } from "./retry";
 import { TokenTracker, type TokenRecord } from "./token-tracker";
 
 // The Operation Executor is the single place in the system that talks to
-// pi-ai. Every AI call — Phase 1 chat, Phase 2 batch generation, drift
+// the LLM. Every AI call — Phase 1 chat, Phase 2 batch generation, drift
 // checks, validations, diagnoses — flows through `execute()`.
 //
 // Responsibilities:
-//   1. Resolve role -> concrete pi-ai Model via providers.ts
-//   2. Build pi-ai Context (system + messages with timestamps)
-//   3. Stream events; accumulate text + usage; forward chunks to onStreamChunk
-//   4. Run the op's parser on the accumulated text
-//   5. On parse failure: build retry messages and try again, up to maxRetries
-//   6. On transport failure: surface the error message into the result
-//   7. Track per-session tokens + cost via TokenTracker
+//   1. Resolve role -> concrete model slug via providers.ts.
+//   2. Stream via the OpenRouter client; accumulate text + usage;
+//      forward chunks to onStreamChunk.
+//   3. Run the op's parser on the accumulated text.
+//   4. On parse failure: build retry messages and try again, up to maxRetries.
+//   5. On transport failure: surface the error message into the result.
+//   6. Track per-session tokens via TokenTracker.
 //
 // What it deliberately does NOT do:
-//   - Decide which prompt to use (that's the job of the prompt registry)
-//   - Persist the result (storage layer)
-//   - Coordinate multi-call patterns (that's two-ai-pattern.ts)
-//   - Decide retry strategy beyond the per-op maxRetries (that's session-manager)
+//   - Decide which prompt to use (that's the job of the prompt registry).
+//   - Persist the result (storage layer).
+//   - Coordinate multi-call patterns (that's two-ai-pattern.ts).
+//   - Decide retry strategy beyond the per-op maxRetries.
 
 export interface ExecutorOptions {
   // Optional shared TokenTracker — pass one if you want session-wide
@@ -74,7 +77,7 @@ export class OperationExecutor {
     const startTime = Date.now();
     const role: RoleName = definition.role ?? "reasoning";
     const resolved = resolveModel(role);
-    const apiKey = getApiKey(resolved.provider);
+    const apiKey = getApiKey();
 
     // Per-op timeout. We honor it via a private AbortController that we
     // combine with the caller's signal (if any) below.
@@ -91,7 +94,7 @@ export class OperationExecutor {
       : timeoutController.signal;
 
     const maxAttempts = 1 + (definition.maxRetries ?? DEFAULT_MAX_RETRIES);
-    let currentMessages = [...definition.messages];
+    let currentMessages: LLMMessage[] = [...definition.messages];
     let lastError: string | null = null;
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -99,14 +102,10 @@ export class OperationExecutor {
 
     try {
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const context: Context = {
-          systemPrompt: definition.systemPrompt,
-          messages: currentMessages.map(toPiAiMessage),
-        };
-
         const callResult = await this.streamCall({
-          model: resolved.model,
-          context,
+          modelId: resolved.modelId,
+          systemPrompt: definition.systemPrompt,
+          messages: currentMessages,
           apiKey,
           signal,
           onChunk: definition.onStreamChunk,
@@ -117,9 +116,10 @@ export class OperationExecutor {
         totalCostUsd += callResult.costUsd;
 
         if (callResult.errorMessage !== null) {
-          // Transport-level error from pi-ai. Don't retry the parser loop —
-          // these are usually unrecoverable in the same shape (auth, network,
-          // model-not-found). Caller can decide whether to retry the whole op.
+          // Transport-level error from OpenRouter. Don't retry the parser
+          // loop — these are usually unrecoverable in the same shape
+          // (auth, network, model-not-found). The caller can decide
+          // whether to retry the whole op.
           lastError = callResult.errorMessage;
           break;
         }
@@ -132,7 +132,7 @@ export class OperationExecutor {
           this.recordTokens(options.sessionId, {
             operationId: definition.operationId,
             provider: resolved.provider,
-            model: resolved.model.id,
+            model: resolved.modelId,
             inputTokens: totalInputTokens,
             outputTokens: totalOutputTokens,
             costUsd: totalCostUsd,
@@ -177,7 +177,7 @@ export class OperationExecutor {
     this.recordTokens(options.sessionId, {
       operationId: definition.operationId,
       provider: resolved.provider,
-      model: resolved.model.id,
+      model: resolved.modelId,
       inputTokens: totalInputTokens,
       outputTokens: totalOutputTokens,
       costUsd: totalCostUsd,
@@ -195,57 +195,51 @@ export class OperationExecutor {
     };
   }
 
-  // Internal: one streaming call to pi-ai. Intentionally `protected` so unit
-  // tests can subclass and stub the network without going through pi-ai.
+  // Internal: one streaming call to the LLM. Intentionally `protected` so
+  // unit tests can subclass and stub the network without going through
+  // OpenRouter.
   protected async streamCall(args: {
-    model: ReturnType<typeof resolveModel>["model"];
-    context: Context;
+    modelId: string;
+    systemPrompt: string;
+    messages: LLMMessage[];
     apiKey: string | undefined;
     signal: AbortSignal;
     onChunk?: (chunk: string) => void;
   }): Promise<StreamCallResult> {
-    let fullText = "";
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let costUsd = 0;
-    let errorMessage: string | null = null;
-
-    const s = stream(args.model, args.context, {
-      apiKey: args.apiKey,
-      signal: args.signal,
-    });
-
-    try {
-      for await (const event of s) {
-        if (event.type === "text_delta") {
-          fullText += event.delta;
-          args.onChunk?.(event.delta);
-        } else if (event.type === "error") {
-          errorMessage =
-            event.error?.errorMessage ?? "pi-ai stream returned error event";
-        }
-      }
-      // pi-ai populates the final usage on the resolved AssistantMessage.
-      const final = await s.result();
-      const usage = final.usage;
-      if (usage) {
-        inputTokens = usage.input ?? 0;
-        outputTokens = usage.output ?? 0;
-        costUsd = usage.cost?.total ?? 0;
-        // If pi-ai wrote an errorMessage onto the final assistant message,
-        // surface it (handles cases where no `error` event was emitted but
-        // the call still failed).
-        if (!errorMessage && final.errorMessage) {
-          errorMessage = final.errorMessage;
-        }
-      }
-    } catch (err) {
-      // Caught from `for await` itself — usually an aborted signal or a
-      // network error that pi-ai threw rather than reporting via event.
-      errorMessage = (err as Error).message ?? "Unknown stream error";
+    if (!args.apiKey) {
+      return {
+        fullText: "",
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        errorMessage:
+          "OPENROUTER_API_KEY is not set. Add it to app/.env.local and restart the dev server.",
+      };
     }
 
-    return { fullText, inputTokens, outputTokens, costUsd, errorMessage };
+    const result = await streamOpenRouter({
+      apiKey: args.apiKey,
+      model: args.modelId,
+      systemPrompt: args.systemPrompt,
+      // LLMMessage's role type is "user" | "assistant" | "system"; the
+      // OpenRouter client accepts the same union.
+      messages: args.messages.map((m) => ({ role: m.role, content: m.content })),
+      signal: args.signal,
+      onChunk: args.onChunk,
+      baseUrl: getBaseUrl(),
+    });
+
+    // OpenRouter's streaming response doesn't return a per-call cost on
+    // the wire for most free/low-cost models. The TokenTracker records
+    // zero cost; surface a real number if OpenRouter exposes one in a
+    // later version of their API.
+    return {
+      fullText: result.fullText,
+      inputTokens: result.inputTokens,
+      outputTokens: result.outputTokens,
+      costUsd: 0,
+      errorMessage: result.errorMessage,
+    };
   }
 
   private recordTokens(
@@ -255,42 +249,6 @@ export class OperationExecutor {
     if (sessionId === undefined) return;
     this.tokenTracker.record(sessionId, record);
   }
-}
-
-// Convert our internal LLMMessage into pi-ai's stricter Message shape.
-// pi-ai requires a numeric `timestamp` on user messages — we add one here so
-// callers don't have to think about it.
-function toPiAiMessage(m: LLMMessage): Context["messages"][number] {
-  if (m.role === "user") {
-    return { role: "user", content: m.content, timestamp: Date.now() };
-  }
-  if (m.role === "assistant") {
-    return {
-      role: "assistant",
-      content: [{ type: "text", text: m.content }],
-      api: "openai-completions",
-      provider: "ollama",
-      model: "n/a",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      timestamp: Date.now(),
-    };
-  }
-  // System messages are passed via Context.systemPrompt, not the messages
-  // array. If a caller put a system role in messages, treat it as user
-  // content prefixed with [system] so it still reaches the model.
-  return {
-    role: "user",
-    content: `[system] ${m.content}`,
-    timestamp: Date.now(),
-  };
 }
 
 // Bridge two AbortSignals into one. Aborts when EITHER source aborts.
@@ -306,3 +264,7 @@ function mergeSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
   b.addEventListener("abort", onAbort(b), { once: true });
   return ctl.signal;
 }
+
+// Re-export describeActiveConfig so callers that imported it from the
+// executor module before the refactor don't need to touch their imports.
+export { describeActiveConfig };

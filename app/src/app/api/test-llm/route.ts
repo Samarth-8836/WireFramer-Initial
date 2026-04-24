@@ -1,12 +1,15 @@
-import type { Context } from "@mariozechner/pi-ai";
-import { stream } from "@mariozechner/pi-ai";
-import { describeActiveConfig, resolveModel } from "@core/llm/providers";
 import type { NextRequest } from "next/server";
 
-// Proof-of-life route. Streams a short response via whichever provider is
-// currently configured (Groq hosted OR local Ollama). This is the Sprint 0
-// verification endpoint — it intentionally bypasses the Operation Executor
-// so we can prove the pi-ai integration works end-to-end first.
+import {
+  describeActiveConfig,
+  getApiKey,
+  resolveModel,
+} from "@core/llm/providers";
+import { streamOpenRouter } from "@core/llm/openrouter-client";
+
+// Proof-of-life smoke route. Streams a short response via OpenRouter so
+// you can verify the API key + the selected model work without going
+// through the full Operation Executor.
 //
 // Usage:
 //   GET /api/test-llm                     -> uses the "reasoning" role
@@ -22,10 +25,7 @@ export async function GET(req: NextRequest) {
     'Say "Hello from the model" and nothing else.';
 
   const resolved = resolveModel(role);
-  const context: Context = {
-    systemPrompt: "You are a terse assistant. Answer with minimum words.",
-    messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-  };
+  const apiKey = getApiKey();
 
   const encoder = new TextEncoder();
   const send = (controller: ReadableStreamDefaultController, event: unknown) =>
@@ -37,35 +37,42 @@ export async function GET(req: NextRequest) {
         type: "meta",
         config: describeActiveConfig(),
         role,
-        modelId: resolved.model.id,
+        modelId: resolved.modelId,
       });
 
-      try {
-        const s = stream(resolved.model, context, {
-          // Ollama ignores the key but pi-ai's openai-completions transport
-          // still requires *some* string. Hosted providers pull from env.
-          apiKey:
-            resolved.provider === "ollama"
-              ? "ollama"
-              : process.env.GROQ_API_KEY,
-        });
-        for await (const event of s) {
-          if (event.type === "text_delta") {
-            send(controller, { type: "text_delta", delta: event.delta });
-          } else if (event.type === "done") {
-            send(controller, { type: "done", reason: event.reason });
-          } else if (event.type === "error") {
-            const errMsg =
-              event.error?.errorMessage ??
-              JSON.stringify(event.error);
-            send(controller, { type: "error", reason: event.reason, error: errMsg });
-          }
-        }
-        const final = await s.result();
+      if (!apiKey) {
         send(controller, {
-          type: "final",
-          usage: final.usage,
+          type: "error",
+          error: "OPENROUTER_API_KEY is not set in .env.local",
         });
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+        return;
+      }
+
+      try {
+        const result = await streamOpenRouter({
+          apiKey,
+          model: resolved.modelId,
+          systemPrompt: "You are a terse assistant. Answer with minimum words.",
+          messages: [{ role: "user", content: prompt }],
+          onChunk: (delta) => {
+            send(controller, { type: "text_delta", delta });
+          },
+        });
+
+        if (result.errorMessage) {
+          send(controller, { type: "error", error: result.errorMessage });
+        } else {
+          send(controller, { type: "done", reason: "stop" });
+          send(controller, {
+            type: "final",
+            usage: {
+              input: result.inputTokens,
+              output: result.outputTokens,
+            },
+          });
+        }
       } catch (err) {
         send(controller, {
           type: "error",
